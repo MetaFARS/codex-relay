@@ -9,7 +9,7 @@ requires-python = ">=3.11"
 description = "Responses API ↔ Chat Completions translation bridge for Codex CLI"
 license = { text = "MIT" }
 readme = "README.md"
-keywords = ["codex", "llm", "proxy", "bridge"]
+keywords = ["codex", "llm", "proxy", "relay"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -19,6 +19,5 @@ classifiers = [
 ]
 
 [tool.maturin]
-# Pure binary distribution — no Python extension module
-# maturin packages the compiled binary into the wheel's scripts/ dir
-python-source = "."
+binaries = ["codex-relay"]
+python-packages = ["codex_relay"]

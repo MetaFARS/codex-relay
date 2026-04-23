@@ -1,27 +1,27 @@
 """
-codex-bridge Python shim.
+codex-relay Python shim.
 
-Provides a minimal interface to start/stop the bridge process.
+Provides a minimal interface to start/stop the relay process.
 The actual binary is installed to PATH by the wheel.
 """
 
+import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 
 def _find_binary() -> Path:
-    path = shutil.which("codex-bridge")
+    path = shutil.which("codex-relay")
     if path:
         return Path(path)
     # Fallback: look next to this file (editable / dev install)
-    local = Path(__file__).parent / "_bin" / "codex-bridge"
+    local = Path(__file__).parent / "_bin" / "codex-relay"
     if local.exists():
         return local
     raise FileNotFoundError(
-        "codex-bridge binary not found. "
-        "Install with: pip install codex-bridge  or  cargo install codex-bridge"
+        "codex-relay binary not found. "
+        "Install with: pip install codex-relay  or  cargo install codex-relay"
     )
 
 
@@ -30,9 +30,7 @@ def start(
     upstream: str = "https://openrouter.ai/api/v1",
     api_key: str = "",
 ) -> subprocess.Popen:
-    """Start codex-bridge as a background process and return the Popen handle."""
-    import os
-
+    """Start codex-relay as a background process and return the Popen handle."""
     env = os.environ.copy()
     if api_key:
         env["CODEX_BRIDGE_API_KEY"] = api_key

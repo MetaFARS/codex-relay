@@ -1,0 +1,65 @@
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  # ── crates.io ─────────────────────────────────────────────────────────────
+  publish-crates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # ── PyPI wheels (multi-platform via maturin-action) ───────────────────────
+  build-wheels:
+    name: wheel ${{ matrix.target }} (${{ matrix.os }})
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+            manylinux: auto
+          - os: ubuntu-latest
+            target: aarch64
+            manylinux: auto
+          - os: macos-latest
+            target: x86_64
+            manylinux: "off"
+          - os: macos-latest
+            target: aarch64
+            manylinux: "off"
+          - os: windows-latest
+            target: x86_64
+            manylinux: "off"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: dist
+
+  publish-pypi:
+    needs: build-wheels
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # trusted publishing (no token needed)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

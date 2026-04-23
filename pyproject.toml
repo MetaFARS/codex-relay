@@ -1,0 +1,24 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "codex-bridge"
+dynamic = ["version"]
+requires-python = ">=3.11"
+description = "Responses API ↔ Chat Completions translation bridge for Codex CLI"
+license = { text = "MIT" }
+readme = "README.md"
+keywords = ["codex", "llm", "proxy", "bridge"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Libraries",
+]
+
+[tool.maturin]
+# Pure binary distribution — no Python extension module
+# maturin packages the compiled binary into the wheel's scripts/ dir
+python-source = "."

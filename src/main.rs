@@ -3,7 +3,7 @@ mod stream;
 mod translate;
 mod types;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use axum::{
     extract::{Request, State},
     http::StatusCode,
@@ -12,7 +12,7 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use session::SessionStore;
 use std::sync::Arc;
 use tracing::{error, info, warn, debug};
@@ -39,7 +39,7 @@ struct Args {
 struct AppState {
     sessions: SessionStore,
     client: Client,
-    upstream: Arc<String>,
+    upstream: Arc<Url>,
     api_key: Arc<String>,
 }
 
@@ -54,10 +54,12 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    let upstream = validate_upstream(&args.upstream)?;
+
     let state = AppState {
         sessions: SessionStore::new(),
         client: Client::new(),
-        upstream: Arc::new(args.upstream.clone()),
+        upstream: Arc::new(upstream.clone()),
         api_key: Arc::new(args.api_key.clone()),
     };
 
@@ -68,7 +70,7 @@ async fn main() -> Result<()> {
         .with_state(state);
 
     let addr = format!("127.0.0.1:{}", args.port);
-    info!("codex-relay listening on {addr} → {}", args.upstream);
+    info!("codex-relay listening on {addr} → {upstream}");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
@@ -76,10 +78,28 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Validate that `--upstream` is an acceptable HTTP(S) URL.
+fn validate_upstream(raw: &str) -> Result<Url> {
+    let url = Url::parse(raw.trim_end_matches('/'))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        s => bail!("upstream URL scheme must be http or https, got: {s}"),
+    }
+    if url.host_str().is_none() {
+        bail!("upstream URL must have a host");
+    }
+    Ok(url)
+}
+
+fn join_base(url: &Url) -> String {
+    let s = url.as_str();
+    if s.ends_with('/') { s.to_string() } else { format!("{s}/") }
+}
+
 /// GET /v1/models — proxy to upstream so Codex gets real model metadata.
 async fn handle_models(State(state): State<AppState>) -> Response {
     info!("GET /v1/models");
-    let url = format!("{}/models", state.upstream);
+    let url = format!("{}models", join_base(&state.upstream));
     let mut builder = state.client.get(&url);
     if !state.api_key.is_empty() {
         builder = builder.bearer_auth(state.api_key.as_str());
@@ -142,7 +162,7 @@ async fn handle_responses_inner(
 
     let model = req.model.clone();
     let mut chat_req = translate::to_chat_request(&req, history.clone(), &state.sessions);
-    let url = format!("{}/chat/completions", state.upstream);
+    let url = format!("{}chat/completions", join_base(&state.upstream));
 
     if req.stream {
         let response_id = state.sessions.new_id();
@@ -223,5 +243,57 @@ async fn handle_blocking(
                 Json(resp).into_response()
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_upstream_https() {
+        let url = validate_upstream("https://openrouter.ai/api/v1").unwrap();
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("openrouter.ai"));
+    }
+
+    #[test]
+    fn test_validate_upstream_http_localhost() {
+        let url = validate_upstream("http://localhost:8080/v1").unwrap();
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(url.host_str(), Some("localhost"));
+    }
+
+    #[test]
+    fn test_validate_upstream_rejects_ftp() {
+        assert!(validate_upstream("ftp://evil.com").is_err());
+    }
+
+    #[test]
+    fn test_validate_upstream_rejects_file() {
+        assert!(validate_upstream("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_validate_upstream_rejects_garbage() {
+        assert!(validate_upstream("not-a-url").is_err());
+    }
+
+    #[test]
+    fn test_validate_upstream_trailing_slash_stripped() {
+        let url = validate_upstream("https://api.example.com/v1/").unwrap();
+        assert!(!url.as_str().ends_with("/v1//"));
+    }
+
+    #[test]
+    fn test_join_base_adds_trailing_slash() {
+        let url = Url::parse("https://api.example.com/v1").unwrap();
+        assert_eq!(join_base(&url), "https://api.example.com/v1/");
+    }
+
+    #[test]
+    fn test_join_base_preserves_trailing_slash() {
+        let url = Url::parse("https://api.example.com/v1/").unwrap();
+        assert_eq!(join_base(&url), "https://api.example.com/v1/");
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "codex-relay"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Responses API ↔ Chat Completions translation bridge for Codex CLI"
 license = "MIT"
@@ -17,7 +17,7 @@ axum = { version = "0.7", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 uuid = { version = "1", features = ["v4"] }
 dashmap = "6"
 anyhow = "1"

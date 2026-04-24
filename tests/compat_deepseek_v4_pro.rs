@@ -188,7 +188,7 @@ fn test_deepseek_v4_pro_multi_turn_reasoning() {
 /// Non-thinking model (e.g. deepseek-chat): when no reasoning was stored,
 /// assistant messages should have reasoning_content=None.
 #[test]
-fn test_deepseek_v4_pro_no_reasoning_for_non_thinking_model() {
+fn test_non_thinking_model_no_reasoning_content() {
     let store = SessionStore::new();
 
     // Don't store any reasoning — simulating a model that doesn't think

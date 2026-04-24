@@ -15,7 +15,7 @@ use clap::Parser;
 use reqwest::{Client, Url};
 use session::SessionStore;
 use std::sync::Arc;
-use tracing::{error, info, warn, debug};
+use tracing::{debug, error, info, warn};
 use types::*;
 
 #[derive(Parser, Debug)]
@@ -59,18 +59,18 @@ async fn main() -> Result<()> {
     let state = AppState {
         sessions: SessionStore::new(),
         client: Client::new(),
-        upstream: Arc::new(upstream.clone()),
-        api_key: Arc::new(args.api_key.clone()),
+        upstream: Arc::new(upstream),
+        api_key: Arc::new(args.api_key),
     };
 
     let app = Router::new()
         .route("/v1/responses", post(handle_responses))
         .route("/v1/models", get(handle_models))
         .fallback(handle_fallback)
-        .with_state(state);
+        .with_state(state.clone());
 
     let addr = format!("127.0.0.1:{}", args.port);
-    info!("codex-relay listening on {addr} → {upstream}");
+    info!("codex-relay listening on {addr} → {}", state.upstream.as_ref());
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
@@ -109,17 +109,17 @@ async fn handle_models(State(state): State<AppState>) -> Response {
             match r.json::<serde_json::Value>().await {
                 Ok(body) => Json(body).into_response(),
                 Err(e) => {
-                    warn!("models parse error: {e}");
+                    warn!("upstream models: parse error: {e}");
                     Json(serde_json::json!({ "object": "list", "data": [] })).into_response()
                 }
             }
         }
         Ok(r) => {
-            warn!("upstream models {}", r.status());
+            warn!("upstream models: status {}", r.status());
             Json(serde_json::json!({ "object": "list", "data": [] })).into_response()
         }
         Err(e) => {
-            warn!("upstream models error: {e}");
+            warn!("upstream models: request error: {e}");
             Json(serde_json::json!({ "object": "list", "data": [] })).into_response()
         }
     }

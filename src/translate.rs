@@ -161,7 +161,20 @@ pub fn to_chat_request(req: &ResponsesRequest, history: Vec<ChatMessage>, sessio
                             if msg.role == "assistant" {
                                 msg.reasoning_content = sessions.get_turn_reasoning(&messages, &msg);
                             }
-                            messages.push(msg);
+                            // System/developer messages from input items must go to the
+                            // front of the array. Codex sometimes interleaves them between
+                            // function_call and function_call_output items, which would
+                            // break the assistant→tool message ordering required by the
+                            // Chat Completions API.
+                            if msg.role == "system" {
+                                if !messages.is_empty() && messages[0].role == "system" {
+                                    messages[0] = msg; // replace existing system prompt
+                                } else {
+                                    messages.insert(0, msg);
+                                }
+                            } else {
+                                messages.push(msg);
+                            }
                         }
                     }
                     i += 1;
@@ -171,13 +184,30 @@ pub fn to_chat_request(req: &ResponsesRequest, history: Vec<ChatMessage>, sessio
     }
 
     ChatRequest {
-        model: req.model.clone(),
+        model: map_model_name(&req.model),
         messages,
         tools: convert_tools(&req.tools),
         temperature: req.temperature,
         max_tokens: req.max_output_tokens,
         stream: req.stream,
     }
+}
+
+/// Map model names via `CODEX_RELAY_MODEL_MAP` env var.
+/// Format: `source-model:target-model,source2:target2`
+/// Example: `CODEX_RELAY_MODEL_MAP="gpt-5.4:deepseek-v4-pro,gpt-5.5:deepseek-v4-pro"`
+fn map_model_name(name: &str) -> String {
+    if let Ok(map_str) = std::env::var("CODEX_RELAY_MODEL_MAP") {
+        for pair in map_str.split(',') {
+            let mut parts = pair.splitn(2, ':');
+            if let (Some(from), Some(to)) = (parts.next(), parts.next()) {
+                if name == from.trim() {
+                    return to.trim().to_string();
+                }
+            }
+        }
+    }
+    name.to_string()
 }
 
 /// Flatten Responses-API tools into Chat Completions tools.

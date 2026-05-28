@@ -233,10 +233,29 @@ fn map_model_name(name: &str) -> String {
 /// - `web_search`, `image_generation`, `computer`, `file_search`, … → drop;
 ///   non-OpenAI providers reject these built-ins.
 fn convert_tools(tools: &[Value]) -> Vec<Value> {
+    let denied = tool_denylist_from_env();
+    convert_tools_with_denylist(tools, &denied)
+}
+
+fn tool_denylist_from_env() -> HashSet<String> {
+    std::env::var("CODEX_RELAY_TOOL_DENYLIST")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn convert_tools_with_denylist(tools: &[Value], denied: &HashSet<String>) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::with_capacity(tools.len());
     for tool in tools {
         match tool.get("type").and_then(Value::as_str) {
-            Some("function") => out.push(convert_tool(tool)),
+            Some("function") => {
+                if !tool_is_denied(tool, None, denied) {
+                    out.push(convert_tool(tool));
+                }
+            }
             Some("namespace") => {
                 let namespace = tool.get("name").and_then(Value::as_str).unwrap_or("");
                 if let Some(subs) = tool.get("tools").and_then(Value::as_array) {
@@ -246,7 +265,9 @@ fn convert_tools(tools: &[Value]) -> Vec<Value> {
                                 .get("name")
                                 .and_then(Value::as_str)
                                 .map(|name| format!("{namespace}{name}"));
-                            out.push(convert_tool_with_name(sub, name.as_deref()));
+                            if !tool_is_denied(sub, name.as_deref(), denied) {
+                                out.push(convert_tool_with_name(sub, name.as_deref()));
+                            }
                         }
                     }
                 }
@@ -255,6 +276,22 @@ fn convert_tools(tools: &[Value]) -> Vec<Value> {
         }
     }
     out
+}
+
+fn tool_is_denied(tool: &Value, override_name: Option<&str>, denied: &HashSet<String>) -> bool {
+    if denied.is_empty() {
+        return false;
+    }
+    let name = override_name
+        .map(str::to_string)
+        .or_else(|| {
+            tool.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
+        .or_else(|| tool.get("name").and_then(Value::as_str).map(String::from));
+    name.is_some_and(|name| denied.contains(&name))
 }
 
 /// Responses API tool format → Chat Completions tool format.
@@ -625,6 +662,84 @@ mod tests {
         });
         let result = convert_tool(&already);
         assert_eq!(result, already);
+    }
+
+    #[test]
+    fn test_convert_tools_preserves_subagent_tools_without_denylist() {
+        let tools = vec![
+            json!({"type": "function", "name": "spawn_agent"}),
+            json!({"type": "function", "name": "wait_agent"}),
+        ];
+        let converted = convert_tools_with_denylist(&tools, &HashSet::new());
+        let names: Vec<&str> = converted
+            .iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|func| func.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .collect();
+        assert_eq!(names, ["spawn_agent", "wait_agent"]);
+    }
+
+    #[test]
+    fn test_convert_tools_denylist_filters_flat_and_namespaced_tools() {
+        let tools = vec![
+            json!({"type": "function", "name": "spawn_agent"}),
+            json!({"type": "function", "name": "exec_command"}),
+            json!({
+                "type": "namespace",
+                "name": "mcp__server__",
+                "tools": [
+                    {"type": "function", "name": "blocked"},
+                    {"type": "function", "name": "allowed"}
+                ]
+            }),
+        ];
+        let denied = HashSet::from([
+            "spawn_agent".to_string(),
+            "mcp__server__blocked".to_string(),
+        ]);
+
+        let converted = convert_tools_with_denylist(&tools, &denied);
+        let names: Vec<&str> = converted
+            .iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|func| func.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .collect();
+
+        assert_eq!(names, ["exec_command", "mcp__server__allowed"]);
+    }
+
+    #[test]
+    fn test_to_chat_request_honors_tool_denylist_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEX_RELAY_TOOL_DENYLIST", "spawn_agent, wait_agent");
+
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Text("hello".into()));
+        req.tools = vec![
+            json!({"type": "function", "name": "spawn_agent"}),
+            json!({"type": "function", "name": "exec_command"}),
+            json!({"type": "function", "name": "wait_agent"}),
+        ];
+
+        let chat = to_chat_request(&req, vec![], &sessions);
+        let names: Vec<&str> = chat
+            .tools
+            .iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|func| func.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .collect();
+
+        assert_eq!(names, ["exec_command"]);
+        std::env::remove_var("CODEX_RELAY_TOOL_DENYLIST");
     }
 
     #[test]

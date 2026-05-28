@@ -118,6 +118,7 @@ Any OpenAI-compatible endpoint works.
 | `CODEX_RELAY_UPSTREAM` | `https://openrouter.ai/api/v1` | Upstream Chat Completions base URL |
 | `CODEX_RELAY_API_KEY` | _(empty)_ | API key forwarded to upstream |
 | `CODEX_RELAY_MODEL_MAP` | _(empty)_ | Comma-separated `source:target` model name translations (e.g., `gpt-5.4:deepseek-v4-pro`) |
+| `CODEX_RELAY_TOOL_DENYLIST` | _(empty)_ | Comma-separated tool names to remove before forwarding tools to the upstream model |
 | `CODEX_RELAY_SESSION_TTL_HOURS` | `168` | Retain idle session/reasoning state for this many hours |
 | `CODEX_RELAY_MAX_SESSIONS` | `256` | Maximum completed response histories retained for `previous_response_id` |
 | `CODEX_RELAY_MAX_SESSION_MEMORY_MB` | `512` | Approximate memory budget for retained session/reasoning state |
@@ -156,6 +157,30 @@ The relay logs tool names only, never tool arguments or message content:
 These lines are useful for checking whether a tool such as `spawn_agent`
 was preserved by the relay, and whether the failure happened before or after
 the model selected that tool.
+
+### Subagent tool routing
+
+Codex subagent tools such as `spawn_agent`, `wait_agent`, and `close_agent`
+are runtime tools. The relay can preserve them in the tool schema and round-trip
+the model's selected function call, but it cannot reliably detect whether the
+local Codex app-server daemon is new enough to execute those calls.
+
+If Codex shows `unsupported call: spawn_agent`, first verify that the Codex CLI
+and app-server daemon versions match. A stale daemon can expose a newer tool
+schema to the model while lacking the handler that executes the returned call.
+Also check your Codex config: `[features] subagents = true` is not recognized;
+use `[features] multi_agent = true` only if you need to override the default.
+
+As an escape hatch for affected runtimes, remove unsupported tools before they
+reach the upstream model:
+
+```bash
+CODEX_RELAY_TOOL_DENYLIST=spawn_agent,wait_agent,close_agent codex-relay
+```
+
+The denylist matches the tool name forwarded to Chat Completions. Namespaced
+MCP tools use their flattened name, for example
+`mcp__codex_apps__github_fetch_issue`.
 
 **Offline (always green, default `cargo test`)**
 

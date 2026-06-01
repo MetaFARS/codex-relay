@@ -453,6 +453,7 @@ pub(crate) fn split_mcp_function_name(name: &str) -> (Option<String>, String) {
 ///     * `input_text` / `text`  → `{type:"text", text}`
 ///     * `input_image` (string) → `{type:"image_url", image_url:{url}}`
 ///     * `image_url`            → normalized to `{type:"image_url", image_url:{url}}`
+///
 ///   Unknown part types pass through; the upstream may reject them and the
 ///   relay propagates that error as-is.
 fn value_to_chat_content(v: Option<&Value>) -> Option<Value> {

@@ -212,6 +212,12 @@ impl SessionStore {
     }
 }
 
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SessionState {
     fn insert_session(&mut self, id: String, messages: Vec<ChatMessage>) {
         let bytes = messages_bytes(&messages);

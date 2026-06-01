@@ -17,6 +17,7 @@ use codex_relay::types::ResponsesRequest;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -68,6 +69,7 @@ fn issue_6_namespace_tools_keep_namespace_when_flattened() {
 #[derive(Clone)]
 struct MockState {
     bodies: Arc<Mutex<Vec<Value>>>,
+    responses: Arc<Mutex<VecDeque<String>>>,
 }
 
 async fn models_handler() -> axum::Json<Value> {
@@ -87,11 +89,12 @@ async fn chat_handler(State(state): State<MockState>, req: axum::extract::Reques
     let body: Value = serde_json::from_slice(&bytes).expect("chat request json");
     state.bodies.lock().unwrap().push(body);
 
-    let sse = concat!(
-        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"OK\"}}]}\n\n",
-        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}\n\n",
-        "data: [DONE]\n\n",
-    );
+    let sse = state
+        .responses
+        .lock()
+        .unwrap()
+        .pop_front()
+        .unwrap_or_else(default_ok_sse);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -100,11 +103,36 @@ async fn chat_handler(State(state): State<MockState>, req: axum::extract::Reques
         .unwrap()
 }
 
+fn sse_from_chunks(chunks: Vec<Value>) -> String {
+    let mut sse = String::new();
+    for chunk in chunks {
+        sse.push_str("data: ");
+        sse.push_str(&chunk.to_string());
+        sse.push_str("\n\n");
+    }
+    sse.push_str("data: [DONE]\n\n");
+    sse
+}
+
+fn default_ok_sse() -> String {
+    sse_from_chunks(vec![
+        json!({"choices":[{"delta":{"role":"assistant","content":"OK"}}]}),
+        json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}),
+    ])
+}
+
 async fn spawn_mock_upstream() -> (u16, Arc<Mutex<Vec<Value>>>) {
+    spawn_mock_upstream_with_responses(Vec::new()).await
+}
+
+async fn spawn_mock_upstream_with_responses(
+    responses: Vec<String>,
+) -> (u16, Arc<Mutex<Vec<Value>>>) {
     let port = pick_port();
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let state = MockState {
         bodies: bodies.clone(),
+        responses: Arc::new(Mutex::new(VecDeque::from(responses))),
     };
     let app = Router::new()
         .route("/v1/models", get(models_handler))
@@ -119,6 +147,30 @@ async fn spawn_mock_upstream() -> (u16, Arc<Mutex<Vec<Value>>>) {
             .expect("mock upstream serve");
     });
     (port, bodies)
+}
+
+async fn post_stream_completed(relay: &Relay, body: Value) -> Value {
+    let resp = reqwest::Client::new()
+        .post(relay.url("/v1/responses"))
+        .json(&body)
+        .send()
+        .await
+        .expect("POST /v1/responses");
+    assert!(resp.status().is_success(), "status {}", resp.status());
+
+    let mut events = resp.bytes_stream().eventsource();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while let Some(ev) = tokio::time::timeout(deadline - Instant::now(), events.next())
+        .await
+        .expect("stream timeout")
+    {
+        let ev = ev.expect("sse parse");
+        if ev.event == "response.completed" {
+            return serde_json::from_str(&ev.data).expect("completed json");
+        }
+    }
+
+    panic!("response.completed event");
 }
 
 struct Relay {
@@ -214,5 +266,109 @@ async fn issue_5_streaming_completed_event_includes_usage() {
         upstream_body["stream_options"],
         json!({"include_usage": true}),
         "streaming Chat Completions requests must ask upstream to include usage"
+    );
+}
+
+#[tokio::test]
+async fn issue_12_spawn_agent_child_context_should_not_replay_parent_history() {
+    let child_task = "Please compute 2+2 and return only the numeric result.";
+    let parent_prompt = "Ask a subagent to solve 2+2.";
+    let tool_args = json!({
+        "task_name": "simple_math",
+        "message": child_task,
+    })
+    .to_string();
+    let spawn_agent_sse = sse_from_chunks(vec![
+        json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_spawn_simple_math",
+                        "function": {
+                            "name": "spawn_agent",
+                            "arguments": tool_args
+                        }
+                    }]
+                }
+            }]
+        }),
+        json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}),
+    ]);
+
+    let (upstream_port, bodies) =
+        spawn_mock_upstream_with_responses(vec![spawn_agent_sse, default_ok_sse()]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let parent_completed = post_stream_completed(
+        &relay,
+        json!({
+            "model": "mock-model",
+            "instructions": "You are the parent agent.",
+            "input": parent_prompt,
+            "tools": [{"type": "function", "name": "spawn_agent"}],
+            "stream": true
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        parent_completed["response"]["output"][0]["name"], "spawn_agent",
+        "mock upstream should first drive a spawn_agent call"
+    );
+    let parent_response_id = parent_completed["response"]["id"]
+        .as_str()
+        .expect("parent response id");
+
+    // Simulate the child agent request that triggers #12: it asks the relay
+    // for the spawned task while also reusing the parent's previous_response_id.
+    // A correctly isolated child thread should send only the child task context
+    // upstream, not the parent's prompt or assistant spawn_agent tool call.
+    let _child_completed = post_stream_completed(
+        &relay,
+        json!({
+            "model": "mock-model",
+            "instructions": "You are the spawned child agent.",
+            "previous_response_id": parent_response_id,
+            "input": child_task,
+            "tools": [
+                {"type": "function", "name": "spawn_agent"},
+                {"type": "function", "name": "wait_agent"}
+            ],
+            "stream": true
+        }),
+    )
+    .await;
+
+    let request_bodies = bodies.lock().unwrap();
+    assert_eq!(request_bodies.len(), 2, "parent and child upstream calls");
+    let child_messages = request_bodies[1]["messages"]
+        .as_array()
+        .expect("child upstream messages");
+
+    assert!(
+        !child_messages
+            .iter()
+            .any(|msg| msg["content"] == parent_prompt),
+        "child upstream request leaked the parent prompt: {child_messages:#?}"
+    );
+    assert!(
+        !child_messages.iter().any(|msg| {
+            msg["tool_calls"].as_array().is_some_and(|calls| {
+                calls
+                    .iter()
+                    .any(|call| call["function"]["name"] == "spawn_agent")
+            })
+        }),
+        "child upstream request replayed the parent's spawn_agent tool call: {child_messages:#?}"
+    );
+    assert_eq!(
+        child_messages
+            .iter()
+            .filter(|msg| msg["role"] == "user")
+            .map(|msg| msg["content"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>(),
+        vec![child_task],
+        "child upstream request should contain exactly the spawned message as user input"
     );
 }

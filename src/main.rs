@@ -276,10 +276,7 @@ async fn print_codex_config(client: &Client, upstream: &Url, api_key: &str, prov
     println!("wire_api = \"responses\"");
     println!(
         "env_key = \"{}_API_KEY\"",
-        provider_name
-            .to_uppercase()
-            .replace('-', "_")
-            .replace('.', "_")
+        provider_name.to_uppercase().replace(['-', '.'], "_")
     );
     println!();
 
@@ -335,11 +332,12 @@ fn estimate_model_properties(model_id: &str) -> ModelProps {
         (262_144, 1_048_576)
     } else if lower.contains("qwen") {
         (131_072, 131_072)
-    } else if lower.contains("kimi") || lower.contains("moonshot") {
-        (128_000, 128_000)
-    } else if lower.contains("mistral") {
-        (128_000, 128_000)
-    } else if lower.contains("llama") || lower.contains("codestral") {
+    } else if lower.contains("kimi")
+        || lower.contains("moonshot")
+        || lower.contains("mistral")
+        || lower.contains("llama")
+        || lower.contains("codestral")
+    {
         (128_000, 128_000)
     } else {
         // Conservative default for unknown models
@@ -526,14 +524,18 @@ async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes
 }
 
 async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Response {
-    let history = req
+    let mut history = req
         .previous_response_id
         .as_deref()
         .map(|id| state.sessions.get_history(id))
         .unwrap_or_default();
+    if should_isolate_spawn_child_request(&req, &history) {
+        debug!("isolating spawned child request from parent response history");
+        history.clear();
+    }
 
     let model = req.model.clone();
-    let mut chat_req = translate::to_chat_request(&req, history.clone(), &state.sessions);
+    let mut chat_req = translate::to_chat_request(&req, history, &state.sessions);
     debug!(
         "→ upstream tools={}",
         summarize_debug_names(chat_tool_debug_names(&chat_req.tools))
@@ -559,6 +561,67 @@ async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Respo
         chat_req.stream = false;
         handle_blocking(state, chat_req, url, model).await
     }
+}
+
+fn should_isolate_spawn_child_request(req: &ResponsesRequest, history: &[ChatMessage]) -> bool {
+    let Some(input_text) = isolated_user_text(&req.input) else {
+        return false;
+    };
+    let completed_tool_calls: std::collections::HashSet<&str> = history
+        .iter()
+        .filter_map(|msg| msg.tool_call_id.as_deref())
+        .collect();
+    history.iter().any(|msg| {
+        msg.tool_calls.as_deref().unwrap_or(&[]).iter().any(|call| {
+            let call_id = call.get("id").and_then(serde_json::Value::as_str);
+            call_id.is_none_or(|id| !completed_tool_calls.contains(id))
+                && spawn_agent_message(call).is_some_and(|message| message == input_text)
+        })
+    })
+}
+
+fn isolated_user_text(input: &ResponsesInput) -> Option<&str> {
+    match input {
+        ResponsesInput::Text(text) => Some(text.as_str()),
+        ResponsesInput::Messages(items) => {
+            if items.len() != 1 {
+                return None;
+            }
+            let item = &items[0];
+            if item.get("type").and_then(serde_json::Value::as_str) != Some("message")
+                || item.get("role").and_then(serde_json::Value::as_str) != Some("user")
+            {
+                return None;
+            }
+            match item.get("content") {
+                Some(serde_json::Value::String(text)) => Some(text.as_str()),
+                Some(serde_json::Value::Array(parts)) if parts.len() == 1 => {
+                    parts[0].get("text").and_then(serde_json::Value::as_str)
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+fn spawn_agent_message(call: &serde_json::Value) -> Option<String> {
+    if call
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(serde_json::Value::as_str)
+        != Some("spawn_agent")
+    {
+        return None;
+    }
+    let arguments = call
+        .get("function")
+        .and_then(|function| function.get("arguments"))
+        .and_then(serde_json::Value::as_str)?;
+    let arguments: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    arguments
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(String::from)
 }
 
 async fn handle_blocking(
@@ -729,6 +792,116 @@ mod tests {
             chat_response_tool_call_debug_names(&chat_resp),
             vec!["spawn_agent".to_string()]
         );
+    }
+
+    #[test]
+    fn test_spawn_child_request_isolated_when_input_matches_spawn_message() {
+        let req = ResponsesRequest {
+            model: "test".into(),
+            input: ResponsesInput::Text("child task".into()),
+            previous_response_id: Some("resp_parent".into()),
+            tools: vec![],
+            stream: false,
+            temperature: None,
+            max_output_tokens: None,
+            system: None,
+            instructions: None,
+        };
+        let history = vec![ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![json!({
+                "id": "call_spawn",
+                "type": "function",
+                "function": {
+                    "name": "spawn_agent",
+                    "arguments": "{\"task_name\":\"child\",\"message\":\"child task\"}"
+                }
+            })]),
+            tool_call_id: None,
+            name: None,
+        }];
+
+        assert!(should_isolate_spawn_child_request(&req, &history));
+    }
+
+    #[test]
+    fn test_spawn_child_isolation_does_not_match_tool_outputs() {
+        let req = ResponsesRequest {
+            model: "test".into(),
+            input: ResponsesInput::Messages(vec![json!({
+                "type": "function_call_output",
+                "call_id": "call_spawn",
+                "output": "child result"
+            })]),
+            previous_response_id: Some("resp_parent".into()),
+            tools: vec![],
+            stream: false,
+            temperature: None,
+            max_output_tokens: None,
+            system: None,
+            instructions: None,
+        };
+        let history = vec![ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![json!({
+                "id": "call_spawn",
+                "type": "function",
+                "function": {
+                    "name": "spawn_agent",
+                    "arguments": "{\"task_name\":\"child\",\"message\":\"child task\"}"
+                }
+            })]),
+            tool_call_id: None,
+            name: None,
+        }];
+
+        assert!(!should_isolate_spawn_child_request(&req, &history));
+    }
+
+    #[test]
+    fn test_spawn_child_isolation_ignores_completed_spawn_calls() {
+        let req = ResponsesRequest {
+            model: "test".into(),
+            input: ResponsesInput::Text("child task".into()),
+            previous_response_id: Some("resp_parent".into()),
+            tools: vec![],
+            stream: false,
+            temperature: None,
+            max_output_tokens: None,
+            system: None,
+            instructions: None,
+        };
+        let history = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![json!({
+                    "id": "call_spawn",
+                    "type": "function",
+                    "function": {
+                        "name": "spawn_agent",
+                        "arguments": "{\"task_name\":\"child\",\"message\":\"child task\"}"
+                    }
+                })]),
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some(serde_json::Value::String("4".into())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: Some("call_spawn".into()),
+                name: None,
+            },
+        ];
+
+        assert!(!should_isolate_spawn_child_request(&req, &history));
     }
 
     #[test]

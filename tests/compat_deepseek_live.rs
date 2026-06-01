@@ -4,8 +4,7 @@
 //!   - DeepSeek models : deepseek-v4-pro, deepseek-v4-flash
 //!   - codex-relay     : current crate (see Cargo.toml `version`)
 //!   - Codex CLI       : not exercised — these tests speak the Responses API
-//!                       directly to the relay, simulating any Codex 0.128.x
-//!                       client.
+//!     directly to the relay, simulating any Codex 0.128.x client.
 //!
 //! Gated on `DEEPSEEK_API_KEY` env var. Each test is marked `#[ignore]`
 //! so the default `cargo test` stays offline. To run:

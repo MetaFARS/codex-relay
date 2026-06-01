@@ -122,6 +122,8 @@ Any OpenAI-compatible endpoint works.
 | `CODEX_RELAY_SESSION_TTL_HOURS` | `168` | Retain idle session/reasoning state for this many hours |
 | `CODEX_RELAY_MAX_SESSIONS` | `256` | Maximum completed response histories retained for `previous_response_id` |
 | `CODEX_RELAY_MAX_SESSION_MEMORY_MB` | `512` | Approximate memory budget for retained session/reasoning state |
+| `CODEX_RELAY_HISTORY_STORE` | `memory` | Retained history backend: `memory` or `disk` |
+| `CODEX_RELAY_HISTORY_DIR` | `.codex-relay-history` | Directory for disk-backed history records |
 | `RUST_LOG` | `codex_relay=info` | Log verbosity |
 
 ## Python API
@@ -157,6 +159,36 @@ The relay logs tool names only, never tool arguments or message content:
 These lines are useful for checking whether a tool such as `spawn_agent`
 was preserved by the relay, and whether the failure happened before or after
 the model selected that tool.
+
+### Disk-backed history
+
+By default, `codex-relay` keeps retained `previous_response_id` histories and
+reasoning lookups in memory. For longer-running processes or deeper debugging,
+you can opt into an inspectable on-disk store:
+
+```bash
+CODEX_RELAY_HISTORY_STORE=disk \
+CODEX_RELAY_HISTORY_DIR=.codex-relay-history \
+codex-relay
+```
+
+The disk backend writes JSON records under:
+
+```text
+.codex-relay-history/
+  sessions/
+  reasoning/
+  turns/
+```
+
+Session records contain the translated Chat Completions `messages` retained for
+a response id. Reasoning records keep call-id and turn-fingerprint lookups used
+to round-trip provider reasoning content. The relay keeps only an in-memory
+index for disk-backed entries and loads payloads on demand.
+
+Treat this directory as sensitive: records may contain prompts, tool outputs,
+and other conversation data. The same TTL/count/byte retention knobs apply to
+disk-backed records, and evicted entries are removed from disk.
 
 ### Subagent tool routing
 

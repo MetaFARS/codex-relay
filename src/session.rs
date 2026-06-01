@@ -1,7 +1,11 @@
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -40,18 +44,43 @@ struct SessionState {
     max_sessions: usize,
     max_stored_bytes: usize,
     ttl: Duration,
+    disk: Option<DiskStore>,
 }
 
 struct SessionEntry {
-    messages: Vec<ChatMessage>,
+    messages: Option<Vec<ChatMessage>>,
     bytes: usize,
-    last_used_at: Instant,
+    last_used_at: SystemTime,
 }
 
 struct StoredString {
-    value: String,
+    value: Option<String>,
     bytes: usize,
-    last_used_at: Instant,
+    last_used_at: SystemTime,
+}
+
+struct DiskStore {
+    root: PathBuf,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DiskSessionRecord {
+    schema_version: u32,
+    response_id: String,
+    created_at_unix_ms: u128,
+    last_used_at_unix_ms: u128,
+    bytes: usize,
+    messages: Vec<ChatMessage>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DiskReasoningRecord {
+    schema_version: u32,
+    key: String,
+    created_at_unix_ms: u128,
+    last_used_at_unix_ms: u128,
+    bytes: usize,
+    value: String,
 }
 
 impl SessionStore {
@@ -74,19 +103,48 @@ impl SessionStore {
         max_stored_bytes: usize,
         ttl: Duration,
     ) -> Self {
+        Self::with_optional_disk(max_sessions, max_stored_bytes, ttl, None)
+    }
+
+    pub fn with_disk_limits_and_ttl(
+        root: impl AsRef<Path>,
+        max_sessions: usize,
+        max_stored_bytes: usize,
+        ttl: Duration,
+    ) -> io::Result<Self> {
+        let disk = DiskStore::new(root.as_ref())?;
+        Ok(Self::with_optional_disk(
+            max_sessions,
+            max_stored_bytes,
+            ttl,
+            Some(disk),
+        ))
+    }
+
+    fn with_optional_disk(
+        max_sessions: usize,
+        max_stored_bytes: usize,
+        ttl: Duration,
+        disk: Option<DiskStore>,
+    ) -> Self {
+        let mut state = SessionState {
+            sessions: HashMap::new(),
+            session_order: VecDeque::new(),
+            reasoning: HashMap::new(),
+            reasoning_order: VecDeque::new(),
+            turn_reasoning: HashMap::new(),
+            turn_reasoning_order: VecDeque::new(),
+            stored_bytes: 0,
+            max_sessions: max_sessions.max(1),
+            max_stored_bytes: max_stored_bytes.max(1),
+            ttl: ttl.max(Duration::from_secs(1)),
+            disk,
+        };
+        state.load_disk_index();
+        state.enforce_limits();
+
         Self {
-            state: Arc::new(Mutex::new(SessionState {
-                sessions: HashMap::new(),
-                session_order: VecDeque::new(),
-                reasoning: HashMap::new(),
-                reasoning_order: VecDeque::new(),
-                turn_reasoning: HashMap::new(),
-                turn_reasoning_order: VecDeque::new(),
-                stored_bytes: 0,
-                max_sessions: max_sessions.max(1),
-                max_stored_bytes: max_stored_bytes.max(1),
-                ttl: ttl.max(Duration::from_secs(1)),
-            })),
+            state: Arc::new(Mutex::new(state)),
         }
     }
 
@@ -104,7 +162,7 @@ impl SessionStore {
     pub fn get_reasoning(&self, call_id: &str) -> Option<String> {
         let mut state = self.state.lock().expect("session store mutex poisoned");
         state.enforce_limits();
-        let value = state.reasoning.get(call_id).map(|v| v.value.clone());
+        let value = state.load_reasoning_value(call_id);
         if value.is_some() {
             state.touch_reasoning(call_id);
         }
@@ -156,7 +214,7 @@ impl SessionStore {
         let key = Self::content_key(content);
         let mut state = self.state.lock().expect("session store mutex poisoned");
         state.enforce_limits();
-        let value = state.turn_reasoning.get(&key).map(|v| v.value.clone());
+        let value = state.load_turn_reasoning_value(key);
         if value.is_some() {
             state.touch_turn_reasoning(key);
         }
@@ -174,11 +232,7 @@ impl SessionStore {
     pub fn get_history(&self, response_id: &str) -> Vec<ChatMessage> {
         let mut state = self.state.lock().expect("session store mutex poisoned");
         state.enforce_limits();
-        let messages = state
-            .sessions
-            .get(response_id)
-            .map(|entry| entry.messages.clone())
-            .unwrap_or_default();
+        let messages = state.load_session_messages(response_id);
         if !messages.is_empty() {
             state.touch_session(response_id);
         }
@@ -219,6 +273,67 @@ impl Default for SessionStore {
 }
 
 impl SessionState {
+    fn load_disk_index(&mut self) {
+        let Some(disk) = &self.disk else {
+            return;
+        };
+
+        let mut sessions = disk.load_sessions();
+        sessions.sort_by_key(|record| record.last_used_at_unix_ms);
+        for record in sessions {
+            let last_used_at = system_time_from_millis(record.last_used_at_unix_ms);
+            self.stored_bytes = self.stored_bytes.saturating_add(record.bytes);
+            self.sessions.insert(
+                record.response_id.clone(),
+                SessionEntry {
+                    messages: None,
+                    bytes: record.bytes,
+                    last_used_at,
+                },
+            );
+            self.session_order.push_back(record.response_id);
+        }
+
+        let mut reasoning = disk.load_reasoning();
+        reasoning.sort_by_key(|record| record.last_used_at_unix_ms);
+        for record in reasoning {
+            let last_used_at = system_time_from_millis(record.last_used_at_unix_ms);
+            self.stored_bytes = self.stored_bytes.saturating_add(record.bytes);
+            self.reasoning.insert(
+                record.key.clone(),
+                StoredString {
+                    value: None,
+                    bytes: record.bytes,
+                    last_used_at,
+                },
+            );
+            self.reasoning_order.push_back(record.key);
+        }
+
+        let mut turn_reasoning = disk.load_turn_reasoning();
+        turn_reasoning.sort_by_key(|record| record.last_used_at_unix_ms);
+        for record in turn_reasoning {
+            let Ok(key) = record.key.parse::<u64>() else {
+                warn!(
+                    "ignoring disk turn reasoning record with invalid key {}",
+                    record.key
+                );
+                continue;
+            };
+            let last_used_at = system_time_from_millis(record.last_used_at_unix_ms);
+            self.stored_bytes = self.stored_bytes.saturating_add(record.bytes);
+            self.turn_reasoning.insert(
+                key,
+                StoredString {
+                    value: None,
+                    bytes: record.bytes,
+                    last_used_at,
+                },
+            );
+            self.turn_reasoning_order.push_back(key);
+        }
+    }
+
     fn insert_session(&mut self, id: String, messages: Vec<ChatMessage>) {
         let bytes = messages_bytes(&messages);
         if bytes > self.max_stored_bytes {
@@ -231,12 +346,22 @@ impl SessionState {
         }
 
         self.remove_session(&id);
-        let now = Instant::now();
+        let now = SystemTime::now();
+        let messages_to_store = if let Some(disk) = &self.disk {
+            if let Err(e) = disk.write_session(&id, now, now, bytes, &messages) {
+                warn!("failed to persist session {id}: {e}");
+                Some(messages)
+            } else {
+                None
+            }
+        } else {
+            Some(messages)
+        };
         self.stored_bytes = self.stored_bytes.saturating_add(bytes);
         self.sessions.insert(
             id.clone(),
             SessionEntry {
-                messages,
+                messages: messages_to_store,
                 bytes,
                 last_used_at: now,
             },
@@ -251,13 +376,24 @@ impl SessionState {
         self.reasoning_order.retain(|key| key != &call_id);
 
         let bytes = call_id.len().saturating_add(reasoning.len());
+        let now = SystemTime::now();
+        let value_to_store = if let Some(disk) = &self.disk {
+            if let Err(e) = disk.write_reasoning(&call_id, now, now, bytes, &reasoning) {
+                warn!("failed to persist reasoning {call_id}: {e}");
+                Some(reasoning)
+            } else {
+                None
+            }
+        } else {
+            Some(reasoning)
+        };
         self.stored_bytes = self.stored_bytes.saturating_add(bytes);
         self.reasoning.insert(
             call_id.clone(),
             StoredString {
-                value: reasoning,
+                value: value_to_store,
                 bytes,
-                last_used_at: Instant::now(),
+                last_used_at: now,
             },
         );
         self.reasoning_order.push_back(call_id);
@@ -271,13 +407,25 @@ impl SessionState {
             .retain(|existing| *existing != key);
 
         let bytes = std::mem::size_of::<u64>().saturating_add(reasoning.len());
+        let key_string = key.to_string();
+        let now = SystemTime::now();
+        let value_to_store = if let Some(disk) = &self.disk {
+            if let Err(e) = disk.write_turn_reasoning(&key_string, now, now, bytes, &reasoning) {
+                warn!("failed to persist turn reasoning {key}: {e}");
+                Some(reasoning)
+            } else {
+                None
+            }
+        } else {
+            Some(reasoning)
+        };
         self.stored_bytes = self.stored_bytes.saturating_add(bytes);
         self.turn_reasoning.insert(
             key,
             StoredString {
-                value: reasoning,
+                value: value_to_store,
                 bytes,
-                last_used_at: Instant::now(),
+                last_used_at: now,
             },
         );
         self.turn_reasoning_order.push_back(key);
@@ -304,7 +452,7 @@ impl SessionState {
     }
 
     fn remove_expired(&mut self) {
-        let cutoff = Instant::now() - self.ttl;
+        let cutoff = SystemTime::now() - self.ttl;
 
         while self
             .session_order
@@ -349,12 +497,18 @@ impl SessionState {
         if let Some(entry) = self.sessions.remove(id) {
             self.stored_bytes = self.stored_bytes.saturating_sub(entry.bytes);
         }
+        if let Some(disk) = &self.disk {
+            disk.remove_session(id);
+        }
     }
 
     fn remove_oldest_reasoning(&mut self) {
         if let Some(key) = self.reasoning_order.pop_front() {
             if let Some(entry) = self.reasoning.remove(&key) {
                 self.stored_bytes = self.stored_bytes.saturating_sub(entry.bytes);
+            }
+            if let Some(disk) = &self.disk {
+                disk.remove_reasoning(&key);
             }
         }
     }
@@ -364,33 +518,305 @@ impl SessionState {
             if let Some(entry) = self.turn_reasoning.remove(&key) {
                 self.stored_bytes = self.stored_bytes.saturating_sub(entry.bytes);
             }
+            if let Some(disk) = &self.disk {
+                disk.remove_turn_reasoning(key);
+            }
         }
     }
 
     fn touch_session(&mut self, id: &str) {
+        let now = SystemTime::now();
         if let Some(entry) = self.sessions.get_mut(id) {
-            entry.last_used_at = Instant::now();
+            entry.last_used_at = now;
+        }
+        if let Some(disk) = &self.disk {
+            if let Some(mut record) = disk.read_session(id) {
+                record.last_used_at_unix_ms = system_time_millis(now);
+                if let Err(e) = disk.write_session_record(&record) {
+                    warn!("failed to touch disk session {id}: {e}");
+                }
+            }
         }
         self.session_order.retain(|existing| existing != id);
         self.session_order.push_back(id.to_string());
     }
 
     fn touch_reasoning(&mut self, call_id: &str) {
+        let now = SystemTime::now();
         if let Some(entry) = self.reasoning.get_mut(call_id) {
-            entry.last_used_at = Instant::now();
+            entry.last_used_at = now;
+        }
+        if let Some(disk) = &self.disk {
+            if let Some(mut record) = disk.read_reasoning(call_id) {
+                record.last_used_at_unix_ms = system_time_millis(now);
+                if let Err(e) = disk.write_reasoning_record(&record) {
+                    warn!("failed to touch disk reasoning {call_id}: {e}");
+                }
+            }
         }
         self.reasoning_order.retain(|existing| existing != call_id);
         self.reasoning_order.push_back(call_id.to_string());
     }
 
     fn touch_turn_reasoning(&mut self, key: u64) {
+        let now = SystemTime::now();
         if let Some(entry) = self.turn_reasoning.get_mut(&key) {
-            entry.last_used_at = Instant::now();
+            entry.last_used_at = now;
+        }
+        if let Some(disk) = &self.disk {
+            if let Some(mut record) = disk.read_turn_reasoning(key) {
+                record.last_used_at_unix_ms = system_time_millis(now);
+                if let Err(e) = disk.write_turn_reasoning_record(&record) {
+                    warn!("failed to touch disk turn reasoning {key}: {e}");
+                }
+            }
         }
         self.turn_reasoning_order
             .retain(|existing| *existing != key);
         self.turn_reasoning_order.push_back(key);
     }
+
+    fn load_session_messages(&self, id: &str) -> Vec<ChatMessage> {
+        let Some(entry) = self.sessions.get(id) else {
+            return Vec::new();
+        };
+        if let Some(messages) = &entry.messages {
+            return messages.clone();
+        }
+        self.disk
+            .as_ref()
+            .and_then(|disk| disk.read_session(id))
+            .map(|record| record.messages)
+            .unwrap_or_default()
+    }
+
+    fn load_reasoning_value(&self, call_id: &str) -> Option<String> {
+        let entry = self.reasoning.get(call_id)?;
+        if let Some(value) = &entry.value {
+            return Some(value.clone());
+        }
+        self.disk
+            .as_ref()
+            .and_then(|disk| disk.read_reasoning(call_id))
+            .map(|record| record.value)
+    }
+
+    fn load_turn_reasoning_value(&self, key: u64) -> Option<String> {
+        let entry = self.turn_reasoning.get(&key)?;
+        if let Some(value) = &entry.value {
+            return Some(value.clone());
+        }
+        self.disk
+            .as_ref()
+            .and_then(|disk| disk.read_turn_reasoning(key))
+            .map(|record| record.value)
+    }
+}
+
+impl DiskStore {
+    fn new(root: &Path) -> io::Result<Self> {
+        let store = Self {
+            root: root.to_path_buf(),
+        };
+        fs::create_dir_all(store.sessions_dir())?;
+        fs::create_dir_all(store.reasoning_dir())?;
+        fs::create_dir_all(store.turns_dir())?;
+        Ok(store)
+    }
+
+    fn sessions_dir(&self) -> PathBuf {
+        self.root.join("sessions")
+    }
+
+    fn reasoning_dir(&self) -> PathBuf {
+        self.root.join("reasoning")
+    }
+
+    fn turns_dir(&self) -> PathBuf {
+        self.root.join("turns")
+    }
+
+    fn session_path(&self, id: &str) -> PathBuf {
+        self.sessions_dir().join(format!("{}.json", encode_key(id)))
+    }
+
+    fn reasoning_path(&self, key: &str) -> PathBuf {
+        self.reasoning_dir()
+            .join(format!("{}.json", encode_key(key)))
+    }
+
+    fn turn_path(&self, key: u64) -> PathBuf {
+        self.turns_dir().join(format!("{key}.json"))
+    }
+
+    fn write_session(
+        &self,
+        id: &str,
+        created_at: SystemTime,
+        last_used_at: SystemTime,
+        bytes: usize,
+        messages: &[ChatMessage],
+    ) -> io::Result<()> {
+        self.write_session_record(&DiskSessionRecord {
+            schema_version: 1,
+            response_id: id.to_string(),
+            created_at_unix_ms: system_time_millis(created_at),
+            last_used_at_unix_ms: system_time_millis(last_used_at),
+            bytes,
+            messages: messages.to_vec(),
+        })
+    }
+
+    fn write_session_record(&self, record: &DiskSessionRecord) -> io::Result<()> {
+        write_json_atomic(&self.session_path(&record.response_id), record)
+    }
+
+    fn read_session(&self, id: &str) -> Option<DiskSessionRecord> {
+        read_json(&self.session_path(id))
+    }
+
+    fn write_reasoning(
+        &self,
+        key: &str,
+        created_at: SystemTime,
+        last_used_at: SystemTime,
+        bytes: usize,
+        value: &str,
+    ) -> io::Result<()> {
+        self.write_reasoning_record(&DiskReasoningRecord {
+            schema_version: 1,
+            key: key.to_string(),
+            created_at_unix_ms: system_time_millis(created_at),
+            last_used_at_unix_ms: system_time_millis(last_used_at),
+            bytes,
+            value: value.to_string(),
+        })
+    }
+
+    fn write_reasoning_record(&self, record: &DiskReasoningRecord) -> io::Result<()> {
+        write_json_atomic(&self.reasoning_path(&record.key), record)
+    }
+
+    fn read_reasoning(&self, key: &str) -> Option<DiskReasoningRecord> {
+        read_json(&self.reasoning_path(key))
+    }
+
+    fn write_turn_reasoning(
+        &self,
+        key: &str,
+        created_at: SystemTime,
+        last_used_at: SystemTime,
+        bytes: usize,
+        value: &str,
+    ) -> io::Result<()> {
+        self.write_turn_reasoning_record(&DiskReasoningRecord {
+            schema_version: 1,
+            key: key.to_string(),
+            created_at_unix_ms: system_time_millis(created_at),
+            last_used_at_unix_ms: system_time_millis(last_used_at),
+            bytes,
+            value: value.to_string(),
+        })
+    }
+
+    fn write_turn_reasoning_record(&self, record: &DiskReasoningRecord) -> io::Result<()> {
+        let key = record.key.parse::<u64>().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid turn key: {e}"),
+            )
+        })?;
+        write_json_atomic(&self.turn_path(key), record)
+    }
+
+    fn read_turn_reasoning(&self, key: u64) -> Option<DiskReasoningRecord> {
+        read_json(&self.turn_path(key))
+    }
+
+    fn load_sessions(&self) -> Vec<DiskSessionRecord> {
+        load_records(&self.sessions_dir())
+    }
+
+    fn load_reasoning(&self) -> Vec<DiskReasoningRecord> {
+        load_records(&self.reasoning_dir())
+    }
+
+    fn load_turn_reasoning(&self) -> Vec<DiskReasoningRecord> {
+        load_records(&self.turns_dir())
+    }
+
+    fn remove_session(&self, id: &str) {
+        remove_file_if_exists(&self.session_path(id));
+    }
+
+    fn remove_reasoning(&self, key: &str) {
+        remove_file_if_exists(&self.reasoning_path(key));
+    }
+
+    fn remove_turn_reasoning(&self, key: u64) {
+        remove_file_if_exists(&self.turn_path(key));
+    }
+}
+
+fn load_records<T: for<'de> Deserialize<'de>>(dir: &Path) -> Vec<T> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            read_json(&path).or_else(|| {
+                warn!("ignoring corrupt disk history record {}", path.display());
+                None
+            })
+        })
+        .collect()
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+    let tmp = path.with_extension(format!("json.tmp-{}", Uuid::new_v4().simple()));
+    let bytes = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
+    fs::write(&tmp, bytes)?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) {
+    if let Err(e) = fs::remove_file(path) {
+        if e.kind() != io::ErrorKind::NotFound {
+            warn!(
+                "failed to remove disk history record {}: {e}",
+                path.display()
+            );
+        }
+    }
+}
+
+fn encode_key(key: &str) -> String {
+    let mut out = String::new();
+    for byte in key.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'.' => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn system_time_millis(time: SystemTime) -> u128 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn system_time_from_millis(millis: u128) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(millis.min(u64::MAX as u128) as u64)
 }
 
 fn messages_bytes(messages: &[ChatMessage]) -> usize {
@@ -458,6 +884,13 @@ mod tests {
             tool_call_id: None,
             name: None,
         }
+    }
+
+    fn temp_history_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("codex-relay-{name}-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -588,7 +1021,7 @@ mod tests {
         {
             let mut state = store.state.lock().unwrap();
             state.sessions.get_mut(&id).unwrap().last_used_at =
-                Instant::now() - Duration::from_secs(61);
+                SystemTime::now() - Duration::from_secs(61);
         }
 
         store.cleanup();
@@ -603,10 +1036,88 @@ mod tests {
         {
             let mut state = store.state.lock().unwrap();
             state.reasoning.get_mut("call_old").unwrap().last_used_at =
-                Instant::now() - Duration::from_secs(61);
+                SystemTime::now() - Duration::from_secs(61);
         }
 
         store.cleanup();
         assert_eq!(store.get_reasoning("call_old"), None);
+    }
+
+    #[test]
+    fn test_disk_store_save_load_history_across_instances() {
+        let dir = temp_history_dir("disk-history");
+        let id = {
+            let store =
+                SessionStore::with_disk_limits_and_ttl(&dir, 10, 1024, Duration::from_secs(60))
+                    .unwrap();
+            store.save(vec![msg("user", Some("hi")), msg("assistant", Some("hey"))])
+        };
+
+        let store = SessionStore::with_disk_limits_and_ttl(&dir, 10, 1024, Duration::from_secs(60))
+            .unwrap();
+        let got = store.get_history(&id);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].text_content(), "hi");
+        assert!(dir.join("sessions").join(format!("{id}.json")).exists());
+    }
+
+    #[test]
+    fn test_disk_store_reasoning_across_instances() {
+        let dir = temp_history_dir("disk-reasoning");
+        {
+            let store =
+                SessionStore::with_disk_limits_and_ttl(&dir, 10, 1024, Duration::from_secs(60))
+                    .unwrap();
+            store.store_reasoning("call_1".into(), "think".into());
+        }
+
+        let store = SessionStore::with_disk_limits_and_ttl(&dir, 10, 1024, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(store.get_reasoning("call_1"), Some("think".into()));
+    }
+
+    #[test]
+    fn test_disk_store_turn_reasoning_across_instances() {
+        let dir = temp_history_dir("disk-turn-reasoning");
+        let assistant = msg("assistant", Some("hello world"));
+        {
+            let store =
+                SessionStore::with_disk_limits_and_ttl(&dir, 10, 1024, Duration::from_secs(60))
+                    .unwrap();
+            store.store_turn_reasoning(&[], &assistant, "deep thought".into());
+        }
+
+        let store = SessionStore::with_disk_limits_and_ttl(&dir, 10, 1024, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(
+            store.get_turn_reasoning(&[], &assistant),
+            Some("deep thought".into())
+        );
+    }
+
+    #[test]
+    fn test_disk_store_evicts_files_by_count() {
+        let dir = temp_history_dir("disk-evict");
+        let store =
+            SessionStore::with_disk_limits_and_ttl(&dir, 1, 1024, Duration::from_secs(60)).unwrap();
+        let id1 = store.save(vec![msg("user", Some("one"))]);
+        let id2 = store.save(vec![msg("user", Some("two"))]);
+
+        assert!(store.get_history(&id1).is_empty());
+        assert_eq!(store.get_history(&id2).len(), 1);
+        assert!(!dir.join("sessions").join(format!("{id1}.json")).exists());
+        assert!(dir.join("sessions").join(format!("{id2}.json")).exists());
+    }
+
+    #[test]
+    fn test_disk_store_ignores_corrupt_session_file() {
+        let dir = temp_history_dir("disk-corrupt");
+        let sessions = dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("resp_bad.json"), b"{not json").unwrap();
+
+        let store = SessionStore::with_disk_limits_and_ttl(&dir, 10, 1024, Duration::from_secs(60))
+            .unwrap();
+        assert!(store.get_history("resp_bad").is_empty());
     }
 }

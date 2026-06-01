@@ -14,7 +14,7 @@ use axum::{
 use clap::Parser;
 use reqwest::{Client, Url};
 use session::{SessionStore, DEFAULT_MAX_SESSIONS, DEFAULT_MAX_SESSION_BYTES, DEFAULT_SESSION_TTL};
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 use types::*;
 
@@ -67,6 +67,18 @@ struct Args {
         default_value_t = DEFAULT_SESSION_TTL.as_secs() / 60 / 60
     )]
     session_ttl_hours: u64,
+
+    /// History retention backend: memory or disk.
+    #[arg(long, env = "CODEX_RELAY_HISTORY_STORE", default_value = "memory")]
+    history_store: String,
+
+    /// Directory used when CODEX_RELAY_HISTORY_STORE=disk.
+    #[arg(
+        long,
+        env = "CODEX_RELAY_HISTORY_DIR",
+        default_value = ".codex-relay-history"
+    )]
+    history_dir: PathBuf,
 }
 
 #[derive(Clone)]
@@ -115,19 +127,31 @@ async fn main() -> Result<()> {
         .saturating_mul(1024)
         .saturating_mul(1024);
     let session_ttl = Duration::from_secs(args.session_ttl_hours.saturating_mul(60 * 60));
-    let state = AppState {
-        sessions: SessionStore::with_limits_and_ttl(
+    let sessions = match args.history_store.as_str() {
+        "memory" => {
+            SessionStore::with_limits_and_ttl(args.max_sessions, max_session_bytes, session_ttl)
+        }
+        "disk" => SessionStore::with_disk_limits_and_ttl(
+            &args.history_dir,
             args.max_sessions,
             max_session_bytes,
             session_ttl,
-        ),
+        )?,
+        other => bail!("history store must be 'memory' or 'disk', got: {other}"),
+    };
+    let state = AppState {
+        sessions,
         client: client.clone(),
         upstream: Arc::new(upstream.clone()),
         api_key: api_key.clone(),
     };
     info!(
-        "session retention: ttl={}h max_sessions={} max_session_memory={} MiB",
-        args.session_ttl_hours, args.max_sessions, args.max_session_memory_mb
+        "session retention: store={} dir={} ttl={}h max_sessions={} max_session_memory={} MiB",
+        args.history_store,
+        args.history_dir.display(),
+        args.session_ttl_hours,
+        args.max_sessions,
+        args.max_session_memory_mb
     );
 
     // Fetch upstream model list asynchronously for user visibility

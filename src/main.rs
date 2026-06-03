@@ -787,7 +787,7 @@ mod tests {
             response_tool_debug_names(&tools),
             vec![
                 "spawn_agent".to_string(),
-                "mcp__codex_apps__github._fetch_issue".to_string(),
+                "mcp__codex_apps__github-_fetch_issue".to_string(),
                 "<web_search>".to_string(),
             ]
         );

@@ -61,7 +61,7 @@ fn issue_6_namespace_tools_keep_namespace_when_flattened() {
     assert!(
         names
             .iter()
-            .any(|n| n == "mcp__codex_apps__github._add_comment_to_issue"),
+            .any(|n| n == "mcp__codex_apps__github-_add_comment_to_issue"),
         "namespace child tool should be flattened with its namespace prefix: {names:?}"
     );
 }
@@ -78,7 +78,7 @@ fn issue_17_blocking_namespaced_tool_calls_emit_namespace_field() {
                     "id": "call_js",
                     "type": "function",
                     "function": {
-                        "name": "mcp__node_repl.js",
+                        "name": "mcp__node_repl-js",
                         "arguments": "{}"
                     }
                 })]),
@@ -308,7 +308,7 @@ async fn issue_17_streaming_namespaced_tool_calls_emit_namespace_field() {
                         "index": 0,
                         "id": "call_js",
                         "function": {
-                            "name": "mcp__node_repl.js",
+                            "name": "mcp__node_repl-js",
                             "arguments": "{}"
                         }
                     }]
@@ -346,7 +346,7 @@ async fn issue_17_streaming_namespaced_tool_calls_emit_namespace_field() {
 
     let request_bodies = bodies.lock().unwrap();
     assert_eq!(
-        request_bodies[0]["tools"][0]["function"]["name"], "mcp__node_repl.js",
+        request_bodies[0]["tools"][0]["function"]["name"], "mcp__node_repl-js",
         "namespace tools must be flattened with a reversible separator"
     );
 }

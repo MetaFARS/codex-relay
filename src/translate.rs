@@ -352,7 +352,12 @@ fn response_function_name_for_chat(item: &Value) -> String {
 }
 
 pub(crate) fn chat_function_name_for_namespace_tool(namespace: &str, name: &str) -> String {
-    format!("{namespace}.{name}")
+    // The Responses API tool-name charset is `^[a-zA-Z0-9_-]+$`, which excludes
+    // `.`. Codex's sanitizer collapses every other character (including `-`) to
+    // `_`, so `-` never appears inside a sanitized namespace or tool name. That
+    // makes it a charset-legal, unambiguously reversible separator: see
+    // `split_mcp_function_name`, which splits on the first `-`.
+    format!("{namespace}-{name}")
 }
 
 /// Convert a Chat Completions response into a Responses API response.
@@ -434,7 +439,7 @@ pub fn from_chat_response(
 }
 
 pub(crate) fn split_mcp_function_name(name: &str) -> (Option<String>, String) {
-    if let Some((namespace, child)) = name.split_once('.') {
+    if let Some((namespace, child)) = name.split_once('-') {
         if !namespace.is_empty() && !child.is_empty() {
             return (Some(namespace.to_string()), child.to_string());
         }
@@ -608,7 +613,7 @@ mod tests {
         let calls = chat.messages[0].tool_calls.as_ref().unwrap();
         assert_eq!(
             calls[0]["function"]["name"].as_str(),
-            Some("mcp__node_repl.status")
+            Some("mcp__node_repl-status")
         );
     }
 
@@ -624,7 +629,7 @@ mod tests {
                         "id": "call_status",
                         "type": "function",
                         "function": {
-                            "name": "mcp__node_repl.status",
+                            "name": "mcp__node_repl-status",
                             "arguments": "{}"
                         }
                     })]),
@@ -739,7 +744,7 @@ mod tests {
                 ]
             }),
         ];
-        let denied = HashSet::from(["spawn_agent".to_string(), "mcp__server.blocked".to_string()]);
+        let denied = HashSet::from(["spawn_agent".to_string(), "mcp__server-blocked".to_string()]);
 
         let converted = convert_tools_with_denylist(&tools, &denied);
         let names: Vec<&str> = converted
@@ -751,7 +756,7 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(names, ["exec_command", "mcp__server.allowed"]);
+        assert_eq!(names, ["exec_command", "mcp__server-allowed"]);
     }
 
     #[test]

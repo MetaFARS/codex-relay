@@ -212,7 +212,7 @@ CODEX_RELAY_TOOL_DENYLIST=spawn_agent,wait_agent,close_agent codex-relay
 
 The denylist matches the tool name forwarded to Chat Completions. Namespaced
 MCP tools use their flattened name, for example
-`mcp__codex_apps__github._fetch_issue`.
+`mcp__codex_apps__github-_fetch_issue`.
 
 **Offline (always green, default `cargo test`)**
 

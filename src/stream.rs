@@ -12,7 +12,7 @@ use tracing::{debug, error, warn};
 
 use crate::{
     session::SessionStore,
-    translate::split_mcp_function_name,
+    translate::{response_function_name_for_responses, NamespaceToolMap},
     types::{ChatMessage, ChatRequest, ChatStreamChunk, ChatUsage},
 };
 
@@ -27,6 +27,7 @@ pub struct StreamArgs {
     /// Used to save correct session history so turn-level reasoning can be
     /// recovered when Codex replays the conversation without previous_response_id.
     pub request_messages: Vec<ChatMessage>,
+    pub namespace_tools: NamespaceToolMap,
     pub model: String,
 }
 
@@ -68,6 +69,7 @@ pub fn translate_stream(
         response_id,
         sessions,
         request_messages,
+        namespace_tools,
         model,
     } = args;
     let msg_item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
@@ -229,7 +231,7 @@ pub fn translate_stream(
         for (rel_idx, (_, tc)) in tool_calls.iter().enumerate() {
             let fc_item_id = format!("fc_{}", uuid::Uuid::new_v4().simple());
             let output_index = base_index + rel_idx;
-            let (namespace, name) = split_mcp_function_name(&tc.name);
+            let (namespace, name) = response_function_name_for_responses(&tc.name, &namespace_tools);
             let mut added_item = json!({
                 "type": "function_call",
                 "id": &fc_item_id,

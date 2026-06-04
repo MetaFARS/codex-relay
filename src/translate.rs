@@ -1,7 +1,15 @@
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::{session::SessionStore, types::*};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceToolName {
+    pub namespace: String,
+    pub name: String,
+}
+
+pub type NamespaceToolMap = HashMap<String, NamespaceToolName>;
 
 /// Convert a Responses API request + prior history into a Chat Completions request.
 pub fn to_chat_request(
@@ -237,6 +245,38 @@ fn convert_tools(tools: &[Value]) -> Vec<Value> {
     convert_tools_with_denylist(tools, &denied)
 }
 
+pub fn namespace_tool_map(tools: &[Value]) -> NamespaceToolMap {
+    let mut map = NamespaceToolMap::new();
+    for tool in tools {
+        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+            continue;
+        }
+        let Some(namespace) = tool.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(subs) = tool.get("tools").and_then(Value::as_array) else {
+            continue;
+        };
+        for sub in subs {
+            if sub.get("type").and_then(Value::as_str) != Some("function") {
+                continue;
+            }
+            let Some(name) = sub.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let chat_name = chat_function_name_for_namespace_tool(namespace, name);
+            map.insert(
+                chat_name,
+                NamespaceToolName {
+                    namespace: namespace.to_string(),
+                    name: name.to_string(),
+                },
+            );
+        }
+    }
+    map
+}
+
 fn tool_denylist_from_env() -> HashSet<String> {
     std::env::var("CODEX_RELAY_TOOL_DENYLIST")
         .unwrap_or_default()
@@ -352,7 +392,10 @@ fn response_function_name_for_chat(item: &Value) -> String {
 }
 
 pub(crate) fn chat_function_name_for_namespace_tool(namespace: &str, name: &str) -> String {
-    format!("{namespace}.{name}")
+    // Chat Completions tool names must match `^[a-zA-Z0-9_-]+$`, so `.` is not
+    // accepted by strict upstreams. Decoding must use NamespaceToolMap whenever
+    // request tools are available; the separator alone is not authoritative.
+    format!("{namespace}-{name}")
 }
 
 /// Convert a Chat Completions response into a Responses API response.
@@ -360,6 +403,15 @@ pub fn from_chat_response(
     id: String,
     model: &str,
     chat: ChatResponse,
+) -> (ResponsesResponse, Vec<ChatMessage>) {
+    from_chat_response_with_tool_map(id, model, chat, &NamespaceToolMap::new())
+}
+
+pub fn from_chat_response_with_tool_map(
+    id: String,
+    model: &str,
+    chat: ChatResponse,
+    namespace_tools: &NamespaceToolMap,
 ) -> (ResponsesResponse, Vec<ChatMessage>) {
     let choice = chat
         .choices
@@ -395,7 +447,7 @@ pub fn from_chat_response(
         for tool_call in tool_calls {
             let function = tool_call.get("function").unwrap_or(&Value::Null);
             let raw_name = function.get("name").and_then(Value::as_str).unwrap_or("");
-            let (namespace, name) = split_mcp_function_name(raw_name);
+            let (namespace, name) = response_function_name_for_responses(raw_name, namespace_tools);
             let arguments = function
                 .get("arguments")
                 .and_then(Value::as_str)
@@ -431,6 +483,16 @@ pub fn from_chat_response(
     };
 
     (response, vec![choice.message])
+}
+
+pub(crate) fn response_function_name_for_responses(
+    name: &str,
+    namespace_tools: &NamespaceToolMap,
+) -> (Option<String>, String) {
+    if let Some(tool_name) = namespace_tools.get(name) {
+        return (Some(tool_name.namespace.clone()), tool_name.name.clone());
+    }
+    split_mcp_function_name(name)
 }
 
 pub(crate) fn split_mcp_function_name(name: &str) -> (Option<String>, String) {
@@ -608,12 +670,12 @@ mod tests {
         let calls = chat.messages[0].tool_calls.as_ref().unwrap();
         assert_eq!(
             calls[0]["function"]["name"].as_str(),
-            Some("mcp__node_repl.status")
+            Some("mcp__node_repl-status")
         );
     }
 
     #[test]
-    fn test_from_chat_response_splits_mcp_function_call_namespace() {
+    fn test_from_chat_response_uses_request_tool_map_for_namespace() {
         let chat = ChatResponse {
             choices: vec![ChatChoice {
                 message: ChatMessage {
@@ -624,7 +686,45 @@ mod tests {
                         "id": "call_status",
                         "type": "function",
                         "function": {
-                            "name": "mcp__node_repl.status",
+                            "name": "mcp__node_repl-status",
+                            "arguments": "{}"
+                        }
+                    })]),
+                    tool_call_id: None,
+                    name: None,
+                },
+            }],
+            usage: None,
+        };
+        let tools = vec![json!({
+            "type": "namespace",
+            "name": "mcp__node_repl",
+            "tools": [{"type": "function", "name": "status"}]
+        })];
+        let namespace_tools = namespace_tool_map(&tools);
+
+        let (resp, _) =
+            from_chat_response_with_tool_map("resp_1".into(), "test-model", chat, &namespace_tools);
+        assert_eq!(resp.output.len(), 1);
+        assert_eq!(resp.output[0]["type"], "function_call");
+        assert_eq!(resp.output[0]["namespace"], "mcp__node_repl");
+        assert_eq!(resp.output[0]["name"], "status");
+        assert_eq!(resp.output[0]["call_id"], "call_status");
+    }
+
+    #[test]
+    fn test_from_chat_response_preserves_hyphen_flat_tool_name() {
+        let chat = ChatResponse {
+            choices: vec![ChatChoice {
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![json!({
+                        "id": "call_status",
+                        "type": "function",
+                        "function": {
+                            "name": "foo-bar",
                             "arguments": "{}"
                         }
                     })]),
@@ -636,11 +736,8 @@ mod tests {
         };
 
         let (resp, _) = from_chat_response("resp_1".into(), "test-model", chat);
-        assert_eq!(resp.output.len(), 1);
-        assert_eq!(resp.output[0]["type"], "function_call");
-        assert_eq!(resp.output[0]["namespace"], "mcp__node_repl");
-        assert_eq!(resp.output[0]["name"], "status");
-        assert_eq!(resp.output[0]["call_id"], "call_status");
+        assert!(resp.output[0].get("namespace").is_none());
+        assert_eq!(resp.output[0]["name"], "foo-bar");
     }
 
     #[test]
@@ -669,6 +766,34 @@ mod tests {
         let (resp, _) = from_chat_response("resp_1".into(), "test-model", chat);
         assert!(resp.output[0].get("namespace").is_none());
         assert_eq!(resp.output[0]["name"], "mcp__node_repljs");
+    }
+
+    #[test]
+    fn test_from_chat_response_keeps_legacy_dot_namespace_split() {
+        let chat = ChatResponse {
+            choices: vec![ChatChoice {
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![json!({
+                        "id": "call_status",
+                        "type": "function",
+                        "function": {
+                            "name": "mcp__node_repl.status",
+                            "arguments": "{}"
+                        }
+                    })]),
+                    tool_call_id: None,
+                    name: None,
+                },
+            }],
+            usage: None,
+        };
+
+        let (resp, _) = from_chat_response("resp_1".into(), "test-model", chat);
+        assert_eq!(resp.output[0]["namespace"], "mcp__node_repl");
+        assert_eq!(resp.output[0]["name"], "status");
     }
 
     #[test]
@@ -739,7 +864,7 @@ mod tests {
                 ]
             }),
         ];
-        let denied = HashSet::from(["spawn_agent".to_string(), "mcp__server.blocked".to_string()]);
+        let denied = HashSet::from(["spawn_agent".to_string(), "mcp__server-blocked".to_string()]);
 
         let converted = convert_tools_with_denylist(&tools, &denied);
         let names: Vec<&str> = converted
@@ -751,7 +876,7 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(names, ["exec_command", "mcp__server.allowed"]);
+        assert_eq!(names, ["exec_command", "mcp__server-allowed"]);
     }
 
     #[test]

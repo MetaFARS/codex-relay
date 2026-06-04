@@ -12,7 +12,9 @@ use axum::{
     Router,
 };
 use codex_relay::session::SessionStore;
-use codex_relay::translate::{from_chat_response, to_chat_request};
+use codex_relay::translate::{
+    from_chat_response_with_tool_map, namespace_tool_map, to_chat_request,
+};
 use codex_relay::types::{ChatChoice, ChatMessage, ChatResponse, ResponsesRequest};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -61,7 +63,7 @@ fn issue_6_namespace_tools_keep_namespace_when_flattened() {
     assert!(
         names
             .iter()
-            .any(|n| n == "mcp__codex_apps__github._add_comment_to_issue"),
+            .any(|n| n == "mcp__codex_apps__github-_add_comment_to_issue"),
         "namespace child tool should be flattened with its namespace prefix: {names:?}"
     );
 }
@@ -78,7 +80,7 @@ fn issue_17_blocking_namespaced_tool_calls_emit_namespace_field() {
                     "id": "call_js",
                     "type": "function",
                     "function": {
-                        "name": "mcp__node_repl.js",
+                        "name": "mcp__node_repl-js",
                         "arguments": "{}"
                     }
                 })]),
@@ -88,11 +90,50 @@ fn issue_17_blocking_namespaced_tool_calls_emit_namespace_field() {
         }],
         usage: None,
     };
+    let tools = vec![json!({
+        "type": "namespace",
+        "name": "mcp__node_repl",
+        "tools": [{"type": "function", "name": "js"}]
+    })];
+    let namespace_tools = namespace_tool_map(&tools);
 
-    let (resp, _) = from_chat_response("resp_17".into(), "mock-model", chat);
+    let (resp, _) =
+        from_chat_response_with_tool_map("resp_17".into(), "mock-model", chat, &namespace_tools);
     assert_eq!(resp.output[0]["type"], "function_call");
     assert_eq!(resp.output[0]["namespace"], "mcp__node_repl");
     assert_eq!(resp.output[0]["name"], "js");
+}
+
+#[test]
+fn issue_20_blocking_hyphen_flat_tool_name_is_not_namespaced() {
+    let chat = ChatResponse {
+        choices: vec![ChatChoice {
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![json!({
+                    "id": "call_flat",
+                    "type": "function",
+                    "function": {
+                        "name": "foo-bar",
+                        "arguments": "{}"
+                    }
+                })]),
+                tool_call_id: None,
+                name: None,
+            },
+        }],
+        usage: None,
+    };
+    let tools = vec![json!({"type": "function", "name": "foo-bar"})];
+    let namespace_tools = namespace_tool_map(&tools);
+
+    let (resp, _) =
+        from_chat_response_with_tool_map("resp_20".into(), "mock-model", chat, &namespace_tools);
+    assert_eq!(resp.output[0]["type"], "function_call");
+    assert!(resp.output[0].get("namespace").is_none());
+    assert_eq!(resp.output[0]["name"], "foo-bar");
 }
 
 #[derive(Clone)]
@@ -179,6 +220,14 @@ async fn spawn_mock_upstream_with_responses(
 }
 
 async fn post_stream_completed(relay: &Relay, body: Value) -> Value {
+    let events = post_stream_events(relay, body).await;
+    events
+        .into_iter()
+        .find_map(|(event, data)| (event == "response.completed").then_some(data))
+        .expect("response.completed event")
+}
+
+async fn post_stream_events(relay: &Relay, body: Value) -> Vec<(String, Value)> {
     let resp = reqwest::Client::new()
         .post(relay.url("/v1/responses"))
         .json(&body)
@@ -188,18 +237,23 @@ async fn post_stream_completed(relay: &Relay, body: Value) -> Value {
     assert!(resp.status().is_success(), "status {}", resp.status());
 
     let mut events = resp.bytes_stream().eventsource();
+    let mut out = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(8);
     while let Some(ev) = tokio::time::timeout(deadline - Instant::now(), events.next())
         .await
         .expect("stream timeout")
     {
         let ev = ev.expect("sse parse");
-        if ev.event == "response.completed" {
-            return serde_json::from_str(&ev.data).expect("completed json");
+        let event = ev.event;
+        let data: Value = serde_json::from_str(&ev.data).expect("event json");
+        let terminal = event == "response.completed" || event == "response.failed";
+        out.push((event, data));
+        if terminal {
+            return out;
         }
     }
 
-    panic!("response.completed event");
+    panic!("terminal response event");
 }
 
 struct Relay {
@@ -308,7 +362,7 @@ async fn issue_17_streaming_namespaced_tool_calls_emit_namespace_field() {
                         "index": 0,
                         "id": "call_js",
                         "function": {
-                            "name": "mcp__node_repl.js",
+                            "name": "mcp__node_repl-js",
                             "arguments": "{}"
                         }
                     }]
@@ -320,7 +374,7 @@ async fn issue_17_streaming_namespaced_tool_calls_emit_namespace_field() {
     let (upstream_port, bodies) = spawn_mock_upstream_with_responses(vec![tool_sse]).await;
     let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
 
-    let completed = post_stream_completed(
+    let events = post_stream_events(
         &relay,
         json!({
             "model": "mock-model",
@@ -339,6 +393,30 @@ async fn issue_17_streaming_namespaced_tool_calls_emit_namespace_field() {
     )
     .await;
 
+    let added = events
+        .iter()
+        .find(|(event, data)| {
+            event == "response.output_item.added" && data["item"]["type"] == "function_call"
+        })
+        .map(|(_, data)| &data["item"])
+        .expect("function_call added item");
+    assert_eq!(added["namespace"], "mcp__node_repl");
+    assert_eq!(added["name"], "js");
+
+    let done = events
+        .iter()
+        .find(|(event, data)| {
+            event == "response.output_item.done" && data["item"]["type"] == "function_call"
+        })
+        .map(|(_, data)| &data["item"])
+        .expect("function_call done item");
+    assert_eq!(done["namespace"], "mcp__node_repl");
+    assert_eq!(done["name"], "js");
+
+    let completed = events
+        .iter()
+        .find_map(|(event, data)| (event == "response.completed").then_some(data))
+        .expect("response.completed");
     let item = &completed["response"]["output"][0];
     assert_eq!(item["type"], "function_call");
     assert_eq!(item["namespace"], "mcp__node_repl");
@@ -346,9 +424,75 @@ async fn issue_17_streaming_namespaced_tool_calls_emit_namespace_field() {
 
     let request_bodies = bodies.lock().unwrap();
     assert_eq!(
-        request_bodies[0]["tools"][0]["function"]["name"], "mcp__node_repl.js",
+        request_bodies[0]["tools"][0]["function"]["name"], "mcp__node_repl-js",
         "namespace tools must be flattened with a reversible separator"
     );
+}
+
+#[tokio::test]
+async fn issue_20_streaming_hyphen_flat_tool_name_is_not_namespaced() {
+    let tool_sse = sse_from_chunks(vec![
+        json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_flat",
+                        "function": {
+                            "name": "foo-bar",
+                            "arguments": "{}"
+                        }
+                    }]
+                }
+            }]
+        }),
+        json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}),
+    ]);
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![tool_sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({
+            "model": "mock-model",
+            "input": "Use the flat tool.",
+            "tools": [{
+                "type": "function",
+                "name": "foo-bar",
+                "parameters": {"type": "object"}
+            }],
+            "stream": true
+        }),
+    )
+    .await;
+
+    let added = events
+        .iter()
+        .find(|(event, data)| {
+            event == "response.output_item.added" && data["item"]["type"] == "function_call"
+        })
+        .map(|(_, data)| &data["item"])
+        .expect("function_call added item");
+    assert!(added.get("namespace").is_none());
+    assert_eq!(added["name"], "foo-bar");
+
+    let done = events
+        .iter()
+        .find(|(event, data)| {
+            event == "response.output_item.done" && data["item"]["type"] == "function_call"
+        })
+        .map(|(_, data)| &data["item"])
+        .expect("function_call done item");
+    assert!(done.get("namespace").is_none());
+    assert_eq!(done["name"], "foo-bar");
+
+    let completed = events
+        .iter()
+        .find_map(|(event, data)| (event == "response.completed").then_some(data))
+        .expect("response.completed");
+    let item = &completed["response"]["output"][0];
+    assert!(item.get("namespace").is_none());
+    assert_eq!(item["name"], "foo-bar");
 }
 
 #[tokio::test]

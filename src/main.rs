@@ -563,6 +563,7 @@ async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Respo
     }
 
     let model = req.model.clone();
+    let namespace_tools = translate::namespace_tool_map(&req.tools);
     let mut chat_req = translate::to_chat_request(&req, history, &state.sessions);
     debug!(
         "→ upstream tools={}",
@@ -582,12 +583,13 @@ async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Respo
             response_id,
             sessions: state.sessions,
             request_messages,
+            namespace_tools,
             model,
         })
         .into_response()
     } else {
         chat_req.stream = false;
-        handle_blocking(state, chat_req, url, model).await
+        handle_blocking(state, chat_req, url, model, namespace_tools).await
     }
 }
 
@@ -657,6 +659,7 @@ async fn handle_blocking(
     chat_req: types::ChatRequest,
     url: String,
     model: String,
+    namespace_tools: translate::NamespaceToolMap,
 ) -> Response {
     let mut builder = state
         .client
@@ -709,7 +712,16 @@ async fn handle_blocking(
                 full_history.push(assistant_msg);
                 let response_id = state.sessions.save(full_history);
 
-                let (resp, _) = translate::from_chat_response(response_id, &model, chat_resp);
+                let (resp, _) = if namespace_tools.is_empty() {
+                    translate::from_chat_response(response_id, &model, chat_resp)
+                } else {
+                    translate::from_chat_response_with_tool_map(
+                        response_id,
+                        &model,
+                        chat_resp,
+                        &namespace_tools,
+                    )
+                };
                 Json(resp).into_response()
             }
         },
@@ -787,7 +799,7 @@ mod tests {
             response_tool_debug_names(&tools),
             vec![
                 "spawn_agent".to_string(),
-                "mcp__codex_apps__github._fetch_issue".to_string(),
+                "mcp__codex_apps__github-_fetch_issue".to_string(),
                 "<web_search>".to_string(),
             ]
         );

@@ -57,8 +57,8 @@ fn namespace_tools_are_flattened() {
         names,
         vec![
             "exec_command",
-            "mcp__codex_apps__github._add_comment_to_issue",
-            "mcp__codex_apps__github._close_issue"
+            "mcp__codex_apps__github-_add_comment_to_issue",
+            "mcp__codex_apps__github-_close_issue"
         ]
     );
 

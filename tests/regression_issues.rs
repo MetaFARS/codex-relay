@@ -679,3 +679,106 @@ async fn issue_12_spawn_agent_child_context_should_not_replay_parent_history() {
         "child upstream request should contain exactly the spawned message as user input"
     );
 }
+
+#[tokio::test]
+async fn issue_24_v2_encrypted_spawn_child_context_is_isolated() {
+    let child_task = "Inspect the repository and report the risky files.";
+    let parent_prompt = "Ask a subagent to inspect the repository.";
+    let tool_args = json!({
+        "task_name": "repo_inspection",
+        "fork_turns": "current_turn",
+        "message": "encrypted:v2:opaque-child-task-ciphertext",
+    })
+    .to_string();
+    let spawn_agent_sse = sse_from_chunks(vec![
+        json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_spawn_repo_inspection",
+                        "function": {
+                            "name": "spawn_agent",
+                            "arguments": tool_args
+                        }
+                    }]
+                }
+            }]
+        }),
+        json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}),
+    ]);
+
+    let (upstream_port, bodies) =
+        spawn_mock_upstream_with_responses(vec![spawn_agent_sse, default_ok_sse()]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let parent_completed = post_stream_completed(
+        &relay,
+        json!({
+            "model": "mock-model",
+            "instructions": "You are the parent agent.",
+            "input": parent_prompt,
+            "tools": [
+                {"type": "function", "name": "spawn_agent"},
+                {"type": "function", "name": "wait_agent"}
+            ],
+            "stream": true
+        }),
+    )
+    .await;
+    let parent_response_id = parent_completed["response"]["id"]
+        .as_str()
+        .expect("parent response id");
+
+    let _child_completed = post_stream_completed(
+        &relay,
+        json!({
+            "model": "mock-model",
+            "instructions": "You are the spawned child agent.",
+            "previous_response_id": parent_response_id,
+            "input": child_task,
+            "tools": [
+                {"type": "function", "name": "spawn_agent"},
+                {"type": "function", "name": "wait_agent"},
+                {"type": "function", "name": "list_agents"},
+                {"type": "function", "name": "interrupt_agent"},
+                {"type": "function", "name": "send_message"},
+                {"type": "function", "name": "followup_task"}
+            ],
+            "stream": true
+        }),
+    )
+    .await;
+
+    let request_bodies = bodies.lock().unwrap();
+    assert_eq!(request_bodies.len(), 2, "parent and child upstream calls");
+    let child_messages = request_bodies[1]["messages"]
+        .as_array()
+        .expect("child upstream messages");
+
+    assert!(
+        !child_messages
+            .iter()
+            .any(|msg| msg["content"] == parent_prompt),
+        "V2 encrypted child request leaked the parent prompt: {child_messages:#?}"
+    );
+    assert!(
+        !child_messages.iter().any(|msg| {
+            msg["tool_calls"].as_array().is_some_and(|calls| {
+                calls
+                    .iter()
+                    .any(|call| call["function"]["name"] == "spawn_agent")
+            })
+        }),
+        "V2 encrypted child request replayed the parent's spawn_agent call: {child_messages:#?}"
+    );
+    assert_eq!(
+        child_messages
+            .iter()
+            .filter(|msg| msg["role"] == "user")
+            .map(|msg| msg["content"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>(),
+        vec![child_task],
+        "V2 encrypted child request should contain exactly the spawned message as user input"
+    );
+}

@@ -601,13 +601,24 @@ fn should_isolate_spawn_child_request(req: &ResponsesRequest, history: &[ChatMes
         .iter()
         .filter_map(|msg| msg.tool_call_id.as_deref())
         .collect();
-    history.iter().any(|msg| {
-        msg.tool_calls.as_deref().unwrap_or(&[]).iter().any(|call| {
+    let pending_spawns = history
+        .iter()
+        .flat_map(|msg| msg.tool_calls.as_deref().unwrap_or(&[]))
+        .filter(|call| {
             let call_id = call.get("id").and_then(serde_json::Value::as_str);
             call_id.is_none_or(|id| !completed_tool_calls.contains(id))
-                && spawn_agent_message(call).is_some_and(|message| message == input_text)
         })
-    })
+        .filter_map(parse_spawn_agent_call)
+        .collect::<Vec<_>>();
+
+    if pending_spawns
+        .iter()
+        .any(|spawn| spawn.message.as_deref() == Some(input_text))
+    {
+        return true;
+    }
+
+    pending_spawns.len() == 1 && pending_spawns[0].is_v2_encrypted_candidate()
 }
 
 fn isolated_user_text(input: &ResponsesInput) -> Option<&str> {
@@ -634,7 +645,22 @@ fn isolated_user_text(input: &ResponsesInput) -> Option<&str> {
     }
 }
 
-fn spawn_agent_message(call: &serde_json::Value) -> Option<String> {
+struct SpawnAgentCall {
+    message: Option<String>,
+    fork_turns: Option<String>,
+}
+
+impl SpawnAgentCall {
+    fn is_v2_encrypted_candidate(&self) -> bool {
+        self.fork_turns.is_some()
+            && self
+                .message
+                .as_deref()
+                .is_some_and(|message| !message.is_empty())
+    }
+}
+
+fn parse_spawn_agent_call(call: &serde_json::Value) -> Option<SpawnAgentCall> {
     if call
         .get("function")
         .and_then(|function| function.get("name"))
@@ -648,10 +674,16 @@ fn spawn_agent_message(call: &serde_json::Value) -> Option<String> {
         .and_then(|function| function.get("arguments"))
         .and_then(serde_json::Value::as_str)?;
     let arguments: serde_json::Value = serde_json::from_str(arguments).ok()?;
-    arguments
-        .get("message")
-        .and_then(serde_json::Value::as_str)
-        .map(String::from)
+    Some(SpawnAgentCall {
+        message: arguments
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
+        fork_turns: arguments
+            .get("fork_turns")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
+    })
 }
 
 async fn handle_blocking(
@@ -864,6 +896,80 @@ mod tests {
         }];
 
         assert!(should_isolate_spawn_child_request(&req, &history));
+    }
+
+    #[test]
+    fn test_spawn_child_request_isolated_for_single_v2_encrypted_spawn() {
+        let req = ResponsesRequest {
+            model: "test".into(),
+            input: ResponsesInput::Text("child task decrypted by codex".into()),
+            previous_response_id: Some("resp_parent".into()),
+            tools: vec![],
+            stream: false,
+            temperature: None,
+            max_output_tokens: None,
+            system: None,
+            instructions: None,
+        };
+        let history = vec![ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![json!({
+                "id": "call_spawn",
+                "type": "function",
+                "function": {
+                    "name": "spawn_agent",
+                    "arguments": "{\"task_name\":\"child\",\"fork_turns\":\"current_turn\",\"message\":\"encrypted:v2:ciphertext\"}"
+                }
+            })]),
+            tool_call_id: None,
+            name: None,
+        }];
+
+        assert!(should_isolate_spawn_child_request(&req, &history));
+    }
+
+    #[test]
+    fn test_spawn_child_v2_encrypted_fallback_requires_unambiguous_spawn() {
+        let req = ResponsesRequest {
+            model: "test".into(),
+            input: ResponsesInput::Text("child task decrypted by codex".into()),
+            previous_response_id: Some("resp_parent".into()),
+            tools: vec![],
+            stream: false,
+            temperature: None,
+            max_output_tokens: None,
+            system: None,
+            instructions: None,
+        };
+        let history = vec![ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![
+                json!({
+                    "id": "call_spawn_a",
+                    "type": "function",
+                    "function": {
+                        "name": "spawn_agent",
+                        "arguments": "{\"task_name\":\"a\",\"fork_turns\":\"current_turn\",\"message\":\"encrypted:v2:a\"}"
+                    }
+                }),
+                json!({
+                    "id": "call_spawn_b",
+                    "type": "function",
+                    "function": {
+                        "name": "spawn_agent",
+                        "arguments": "{\"task_name\":\"b\",\"fork_turns\":\"current_turn\",\"message\":\"encrypted:v2:b\"}"
+                    }
+                }),
+            ]),
+            tool_call_id: None,
+            name: None,
+        }];
+
+        assert!(!should_isolate_spawn_child_request(&req, &history));
     }
 
     #[test]

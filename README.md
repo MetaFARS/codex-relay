@@ -86,6 +86,7 @@ input_modalities = ["text"]
 | `--drop-upstream-params` | `CODEX_RELAY_DROP_PARAMS` | _(empty)_ | JSON array of top-level upstream request parameters to remove |
 | `--model-map` | `CODEX_RELAY_MODEL_MAP` | _(empty)_ | Comma-separated `source:target` model name translations |
 | `--print-config` | _(none)_ | — | Print a Codex config snippet with `model_properties` and exit |
+| `--record-corpus` | `CODEX_RELAY_RECORD_CORPUS` | _(off)_ | Append the conversation flow of every completed turn to daily JSONL files (OpenAI messages format) in this directory |
 | `--session-ttl-hours` | `CODEX_RELAY_SESSION_TTL_HOURS` | `168` | Retain idle `previous_response_id` history and reasoning state for this many hours |
 | `--max-sessions` | `CODEX_RELAY_MAX_SESSIONS` | `256` | Maximum completed response histories retained for continuation |
 | `--max-session-memory-mb` | `CODEX_RELAY_MAX_SESSION_MEMORY_MB` | `512` | Approximate memory budget for retained session/reasoning state |
@@ -144,6 +145,7 @@ codex-relay --upstream https://api.deepseek.com/v1 --api-key "$DEEPSEEK_API_KEY"
 | `CODEX_RELAY_MAX_SESSION_MEMORY_MB` | `512` | Approximate memory budget for retained session/reasoning state |
 | `CODEX_RELAY_HISTORY_STORE` | `memory` | Retained history backend: `memory` or `disk` |
 | `CODEX_RELAY_HISTORY_DIR` | `.codex-relay-history` | Directory for disk-backed history records |
+| `CODEX_RELAY_RECORD_CORPUS` | _(off)_ | Directory to append per-turn conversation records (OpenAI messages JSONL); off unless set |
 | `RUST_LOG` | `codex_relay=info` | Log verbosity |
 
 ## Python API
@@ -209,6 +211,58 @@ index for disk-backed entries and loads payloads on demand.
 Treat this directory as sensitive: records may contain prompts, tool outputs,
 and other conversation data. The same TTL/count/byte retention knobs apply to
 disk-backed records, and evicted entries are removed from disk.
+
+### Corpus recording
+
+For building datasets, `--record-corpus <dir>` continuously appends the
+conversation flow to daily-sharded JSONL files in **OpenAI messages format**:
+
+```bash
+codex-relay --record-corpus ./corpus \
+  --upstream https://api.deepseek.com/v1 --api-key "$DEEPSEEK_API_KEY"
+```
+
+This is **off by default** and is a separate subsystem from the retention cache
+above: the corpus is an **append-only archive** that is never evicted, whereas
+the session store is an evictable continuation cache.
+
+Each line is an *incremental turn event* — only the messages new to that turn
+are written, so the same conversation is reconstructed by concatenating the
+`messages` of every event that shares a `conversation_id`:
+
+```text
+corpus/
+  corpus-2026-04-04.jsonl
+```
+
+```json
+{
+  "conversation_id": "resp_abc…",
+  "response_id": "resp_def…",
+  "parent_response_id": "resp_abc…",
+  "timestamp_unix_ms": 1783447750503,
+  "model": "deepseek-chat",
+  "messages": [ { "role": "user", "content": "…" }, { "role": "assistant", "content": "…" } ]
+}
+```
+
+The `messages` payload uses the standard OpenAI schema and preserves
+`tool_calls`, `role: "tool"` outputs (`tool_call_id`), and assistant
+`reasoning_content` (a widely-used non-standard field that training frameworks
+ignore if unknown). The first event of a conversation includes the system
+prompt; subsequent events omit it. Isolated `spawn_agent` child requests start
+their own `conversation_id`.
+
+To fold the turn events back into whole-conversation OpenAI records:
+
+```bash
+jq -s 'group_by(.conversation_id)[]
+       | {messages: (map(.messages) | add)}' corpus/*.jsonl
+```
+
+> ⚠️ Records contain prompts, tool call **arguments**, and tool outputs — more
+> than the debug logs ever emit. Treat the directory as sensitive, especially
+> when combined with `--bind` on a non-loopback address.
 
 ### Subagent tool routing
 

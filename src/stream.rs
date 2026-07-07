@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tracing::{debug, error, warn};
 
 use crate::{
+    corpus::CorpusRecorder,
     session::SessionStore,
     translate::{response_function_name_for_responses, NamespaceToolMap},
     types::{ChatMessage, ChatRequest, ChatStreamChunk, ChatUsage},
@@ -31,6 +32,8 @@ pub struct StreamArgs {
     pub request_messages: Vec<ChatMessage>,
     pub namespace_tools: NamespaceToolMap,
     pub model: String,
+    pub corpus: Option<CorpusRecorder>,
+    pub previous_response_id: Option<String>,
 }
 
 struct ToolCallAccum {
@@ -74,6 +77,8 @@ pub fn translate_stream(
         request_messages,
         namespace_tools,
         model,
+        corpus,
+        previous_response_id,
     } = args;
     let msg_item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     let reasoning_item_id = format!("rs_{}", uuid::Uuid::new_v4().simple());
@@ -411,6 +416,14 @@ pub fn translate_stream(
             // so that history is complete for the next turn.
             let mut messages = request_messages;
             messages.push(assistant_msg);
+            if let Some(corpus) = &corpus {
+                corpus.record_turn(
+                    previous_response_id.as_deref(),
+                    &response_id,
+                    &model,
+                    &messages,
+                );
+            }
             sessions.save_with_id(response_id.clone(), messages);
 
             // Build output array for response.completed

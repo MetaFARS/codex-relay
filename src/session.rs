@@ -252,7 +252,8 @@ impl SessionStore {
         state.enforce_limits();
     }
 
-    /// Allocate an id and store atomically (non-streaming path).
+    /// Allocate an id and store atomically.
+    #[allow(dead_code)]
     pub fn save(&self, messages: Vec<ChatMessage>) -> String {
         let id = self.new_id();
         self.save_with_id(id.clone(), messages);

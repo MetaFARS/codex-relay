@@ -1,3 +1,4 @@
+mod corpus;
 mod session;
 mod stream;
 mod translate;
@@ -13,6 +14,7 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
+use corpus::CorpusRecorder;
 use reqwest::{Client, Url};
 use session::{SessionStore, DEFAULT_MAX_SESSIONS, DEFAULT_MAX_SESSION_BYTES, DEFAULT_SESSION_TTL};
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -94,6 +96,13 @@ struct Args {
         default_value = ".codex-relay-history"
     )]
     history_dir: PathBuf,
+
+    /// Append the conversation flow of every completed turn to daily-sharded
+    /// JSONL files (OpenAI messages format) in this directory. Off by default.
+    /// Records contain prompts, tool call arguments, and tool outputs — treat
+    /// the directory as sensitive.
+    #[arg(long, env = "CODEX_RELAY_RECORD_CORPUS")]
+    record_corpus: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -103,6 +112,7 @@ struct AppState {
     upstream: Arc<Url>,
     api_key: Arc<String>,
     upstream_request: Arc<UpstreamRequestConfig>,
+    corpus: Option<CorpusRecorder>,
 }
 
 #[tokio::main]
@@ -159,12 +169,24 @@ async fn main() -> Result<()> {
         )?,
         other => bail!("history store must be 'memory' or 'disk', got: {other}"),
     };
+    let corpus = match &args.record_corpus {
+        Some(dir) => {
+            let recorder = CorpusRecorder::new(dir)?;
+            warn!(
+                "corpus recording ENABLED → {} (records prompts, tool arguments, and tool outputs; treat as sensitive)",
+                dir.display()
+            );
+            Some(recorder)
+        }
+        None => None,
+    };
     let state = AppState {
         sessions,
         client: client.clone(),
         upstream: Arc::new(upstream.clone()),
         api_key: api_key.clone(),
         upstream_request: upstream_request.clone(),
+        corpus,
     };
     info!(
         "session retention: store={} dir={} ttl={}h max_sessions={} max_session_memory={} MiB",
@@ -602,6 +624,7 @@ async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Respo
     );
     let url = format!("{}chat/completions", join_base(&state.upstream));
 
+    let previous_response_id = req.previous_response_id.clone();
     if req.stream {
         let response_id = state.sessions.new_id();
         chat_req.stream = true;
@@ -617,11 +640,13 @@ async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Respo
             request_messages,
             namespace_tools,
             model,
+            corpus: state.corpus,
+            previous_response_id,
         })
         .into_response()
     } else {
         chat_req.stream = false;
-        handle_blocking(state, chat_req, url, model, namespace_tools).await
+        handle_blocking(state, chat_req, url, model, namespace_tools, previous_response_id).await
     }
 }
 
@@ -724,6 +749,7 @@ async fn handle_blocking(
     url: String,
     model: String,
     namespace_tools: translate::NamespaceToolMap,
+    previous_response_id: Option<String>,
 ) -> Response {
     let mut builder = state
         .client
@@ -782,7 +808,16 @@ async fn handle_blocking(
 
                 let mut full_history = chat_req.messages.clone();
                 full_history.push(assistant_msg);
-                let response_id = state.sessions.save(full_history);
+                let response_id = state.sessions.new_id();
+                if let Some(corpus) = &state.corpus {
+                    corpus.record_turn(
+                        previous_response_id.as_deref(),
+                        &response_id,
+                        &model,
+                        &full_history,
+                    );
+                }
+                state.sessions.save_with_id(response_id.clone(), full_history);
 
                 let (resp, _) = if namespace_tools.is_empty() {
                     translate::from_chat_response(response_id, &model, chat_resp)

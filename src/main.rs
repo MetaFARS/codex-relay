@@ -32,6 +32,10 @@ struct Args {
     #[arg(long, env = "CODEX_RELAY_PORT", default_value = "4444")]
     port: u16,
 
+    /// IP address to bind the listener to (e.g. 0.0.0.0 to accept remote connections).
+    #[arg(long, env = "CODEX_RELAY_BIND", default_value = "127.0.0.1")]
+    bind: std::net::IpAddr,
+
     #[arg(
         long,
         env = "CODEX_RELAY_UPSTREAM",
@@ -186,7 +190,8 @@ async fn main() -> Result<()> {
     // Disable axum's default 2 MiB body cap: Codex CLI may send base64-encoded
     // image attachments that easily exceed it, and a framework-level 413 looks
     // like a transport-layer death to Codex and crashes the session (#2).
-    // The relay only binds 127.0.0.1, so DoS isn't a concern here.
+    // The relay binds 127.0.0.1 by default; --bind can expose it more widely,
+    // so be mindful of DoS when binding to a non-loopback address.
     let app = Router::new()
         .route("/v1/responses", post(handle_responses))
         .route("/v1/models", get(handle_models))
@@ -194,8 +199,8 @@ async fn main() -> Result<()> {
         .layer(DefaultBodyLimit::disable())
         .with_state(state.clone());
 
-    let addr = format!("127.0.0.1:{}", args.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let addr = std::net::SocketAddr::new(args.bind, args.port);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     // Log the actual bound address so that `--port 0` (ephemeral port) reports
     // the real port instead of `:0`.
     info!(

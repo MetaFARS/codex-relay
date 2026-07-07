@@ -29,6 +29,7 @@ def start(
     port: int = 4444,
     upstream: str = "https://openrouter.ai/api/v1",
     api_key: str = "",
+    bind: str = "127.0.0.1",
 ) -> subprocess.Popen:
     """Start codex-relay as a background process and return the Popen handle."""
     env = os.environ.copy()
@@ -36,7 +37,15 @@ def start(
         env["CODEX_RELAY_API_KEY"] = api_key
 
     return subprocess.Popen(
-        [str(_find_binary()), "--port", str(port), "--upstream", upstream],
+        [
+            str(_find_binary()),
+            "--port",
+            str(port),
+            "--bind",
+            bind,
+            "--upstream",
+            upstream,
+        ],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,

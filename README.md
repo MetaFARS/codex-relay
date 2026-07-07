@@ -79,6 +79,7 @@ input_modalities = ["text"]
 | Flag | Env var | Default | Description |
 |---|---|---|---|
 | `--port` | `CODEX_RELAY_PORT` | `4444` | Listen port |
+| `--bind` | `CODEX_RELAY_BIND` | `127.0.0.1` | IP address to bind the listener to (e.g. `0.0.0.0` to accept remote connections) |
 | `--upstream` | `CODEX_RELAY_UPSTREAM` | `https://openrouter.ai/api/v1` | Upstream Chat Completions base URL |
 | `--api-key` | `CODEX_RELAY_API_KEY` | _(empty)_ | API key forwarded to upstream |
 | `--upstream-extra-params` | `CODEX_RELAY_UPSTREAM_EXTRA_PARAMS` | _(empty)_ | JSON object merged into each upstream Chat Completions request |
@@ -131,6 +132,7 @@ codex-relay --upstream https://api.deepseek.com/v1 --api-key "$DEEPSEEK_API_KEY"
 | Variable | Default | Description |
 |---|---|---|
 | `CODEX_RELAY_PORT` | `4444` | Port to listen on |
+| `CODEX_RELAY_BIND` | `127.0.0.1` | IP address to bind the listener to (e.g. `0.0.0.0` to accept remote connections) |
 | `CODEX_RELAY_UPSTREAM` | `https://openrouter.ai/api/v1` | Upstream Chat Completions base URL |
 | `CODEX_RELAY_API_KEY` | _(empty)_ | API key forwarded to upstream |
 | `CODEX_RELAY_UPSTREAM_EXTRA_PARAMS` | _(empty)_ | JSON object merged into each upstream Chat Completions request body |

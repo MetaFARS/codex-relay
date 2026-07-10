@@ -11,6 +11,14 @@ pub struct NamespaceToolName {
 
 pub type NamespaceToolMap = HashMap<String, NamespaceToolName>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomToolName {
+    pub name: String,
+    pub argument_field: String,
+}
+
+pub type CustomToolMap = HashMap<String, CustomToolName>;
+
 /// Convert a Responses API request + prior history into a Chat Completions request.
 pub fn to_chat_request(
     req: &ResponsesRequest,
@@ -82,7 +90,7 @@ pub fn to_chat_request(
                 let item = &items[i];
                 let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-                if item_type == "function_call" {
+                if matches!(item_type, "function_call" | "custom_tool_call") {
                     // Skip function_call items whose call_id already exists in history.
                     // Duplicates occur when both previous_response_id and input replay
                     // the same function_call entries from prior output.
@@ -91,23 +99,28 @@ pub fn to_chat_request(
                         i += 1;
                         continue;
                     }
-                    // Collect this and all immediately following function_call items
+                    // Collect this and all immediately following tool call items
                     // into one assistant message with multiple tool_calls entries.
                     let mut grouped: Vec<Value> = Vec::new();
                     let mut reasoning_content: Option<String> = None;
 
                     while i < items.len() {
                         let cur = &items[i];
-                        if cur.get("type").and_then(|v| v.as_str()).unwrap_or("") != "function_call"
-                        {
+                        let cur_type = cur.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if !matches!(cur_type, "function_call" | "custom_tool_call") {
                             break;
                         }
                         let call_id = cur.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                         let name = response_function_name_for_chat(cur);
-                        let args = cur
-                            .get("arguments")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("{}");
+                        let args = if cur_type == "custom_tool_call" {
+                            let input = cur.get("input").and_then(Value::as_str).unwrap_or("");
+                            json!({ custom_argument_field(&name): input }).to_string()
+                        } else {
+                            cur.get("arguments")
+                                .and_then(Value::as_str)
+                                .unwrap_or("{}")
+                                .to_string()
+                        };
                         if reasoning_content.is_none() {
                             reasoning_content = sessions.get_reasoning(call_id);
                         }
@@ -134,7 +147,7 @@ pub fn to_chat_request(
                     messages.push(msg);
                 } else {
                     match item_type {
-                        "function_call_output" => {
+                        "function_call_output" | "custom_tool_call_output" => {
                             let call_id =
                                 item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                             // Skip function_call_output items if a tool response
@@ -295,6 +308,38 @@ pub fn namespace_tool_map(tools: &[Value]) -> NamespaceToolMap {
     map
 }
 
+pub fn custom_tool_map(tools: &[Value]) -> CustomToolMap {
+    tools
+        .iter()
+        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("custom"))
+        .filter_map(|tool| {
+            let name = tool.get("name").and_then(Value::as_str)?;
+            Some((
+                name.to_string(),
+                CustomToolName {
+                    name: name.to_string(),
+                    argument_field: custom_argument_field(name).to_string(),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn custom_argument_field(name: &str) -> &'static str {
+    if name == "apply_patch" {
+        "patch"
+    } else {
+        "input"
+    }
+}
+
+pub(crate) fn custom_tool_input(arguments: &str, argument_field: &str) -> String {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| value.get(argument_field)?.as_str().map(String::from))
+        .unwrap_or_else(|| arguments.to_string())
+}
+
 fn tool_denylist_from_env() -> HashSet<String> {
     std::env::var("CODEX_RELAY_TOOL_DENYLIST")
         .unwrap_or_default()
@@ -329,6 +374,34 @@ fn convert_tools_with_denylist(tools: &[Value], denied: &HashSet<String>) -> Vec
                         }
                     }
                 }
+            }
+            Some("custom") => {
+                let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                if denied.contains(name) {
+                    continue;
+                }
+                let argument_field = custom_argument_field(name);
+                let description = tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Provide the raw custom tool input.");
+                out.push(json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                argument_field: {"type": "string"}
+                            },
+                            "required": [argument_field],
+                            "additionalProperties": false
+                        }
+                    }
+                }));
             }
             _ => {}
         }
@@ -431,6 +504,16 @@ pub fn from_chat_response_with_tool_map(
     chat: ChatResponse,
     namespace_tools: &NamespaceToolMap,
 ) -> (ResponsesResponse, Vec<ChatMessage>) {
+    from_chat_response_with_tool_maps(id, model, chat, namespace_tools, &CustomToolMap::new())
+}
+
+pub fn from_chat_response_with_tool_maps(
+    id: String,
+    model: &str,
+    chat: ChatResponse,
+    namespace_tools: &NamespaceToolMap,
+    custom_tools: &CustomToolMap,
+) -> (ResponsesResponse, Vec<ChatMessage>) {
     let choice = chat
         .choices
         .into_iter()
@@ -471,20 +554,30 @@ pub fn from_chat_response_with_tool_map(
                 .get("arguments")
                 .and_then(Value::as_str)
                 .unwrap_or("{}");
-            let mut item = json!({
-                "type": "function_call",
-                "id": format!("fc_{}", uuid::Uuid::new_v4().simple()),
-                "call_id": tool_call
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or(""),
-                "name": name,
-                "arguments": arguments,
-                "status": "completed"
-            });
-            if let Some(namespace) = namespace {
-                item["namespace"] = Value::String(namespace);
-            }
+            let call_id = tool_call.get("id").and_then(Value::as_str).unwrap_or("");
+            let item = if let Some(custom) = custom_tools.get(raw_name) {
+                json!({
+                    "type": "custom_tool_call",
+                    "id": format!("ctc_{}", uuid::Uuid::new_v4().simple()),
+                    "call_id": call_id,
+                    "name": custom.name,
+                    "input": custom_tool_input(arguments, &custom.argument_field),
+                    "status": "completed"
+                })
+            } else {
+                let mut item = json!({
+                    "type": "function_call",
+                    "id": format!("fc_{}", uuid::Uuid::new_v4().simple()),
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments,
+                    "status": "completed"
+                });
+                if let Some(namespace) = namespace {
+                    item["namespace"] = Value::String(namespace);
+                }
+                item
+            };
             output.push(item);
         }
     }
@@ -676,6 +769,37 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0]["id"], "c1");
         assert_eq!(calls[1]["id"], "c2");
+    }
+
+    #[test]
+    fn test_custom_tool_call_and_output_replay_as_chat_messages() {
+        let sessions = SessionStore::new();
+        let patch = "*** Begin Patch\n*** End Patch";
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({
+                "type": "custom_tool_call",
+                "call_id": "call_patch",
+                "name": "apply_patch",
+                "input": patch
+            }),
+            json!({
+                "type": "custom_tool_call_output",
+                "call_id": "call_patch",
+                "output": "Done!"
+            }),
+        ]));
+
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages.len(), 2);
+        let call = &chat.messages[0].tool_calls.as_ref().unwrap()[0];
+        assert_eq!(call["function"]["name"], "apply_patch");
+        assert_eq!(
+            serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap()).unwrap(),
+            json!({"patch": patch})
+        );
+        assert_eq!(chat.messages[1].role, "tool");
+        assert_eq!(chat.messages[1].tool_call_id.as_deref(), Some("call_patch"));
+        assert_eq!(chat.messages[1].text_content(), "Done!");
     }
 
     #[test]

@@ -13,7 +13,9 @@ use tracing::{debug, error, warn};
 use crate::{
     corpus::CorpusRecorder,
     session::SessionStore,
-    translate::{response_function_name_for_responses, NamespaceToolMap},
+    translate::{
+        custom_tool_input, response_function_name_for_responses, CustomToolMap, NamespaceToolMap,
+    },
     types::{ChatMessage, ChatRequest, ChatStreamChunk, ChatUsage},
     upstream_request::UpstreamRequestConfig,
 };
@@ -31,6 +33,7 @@ pub struct StreamArgs {
     /// recovered when Codex replays the conversation without previous_response_id.
     pub request_messages: Vec<ChatMessage>,
     pub namespace_tools: NamespaceToolMap,
+    pub custom_tools: CustomToolMap,
     pub model: String,
     pub corpus: Option<CorpusRecorder>,
     pub previous_response_id: Option<String>,
@@ -76,6 +79,7 @@ pub fn translate_stream(
         sessions,
         request_messages,
         namespace_tools,
+        custom_tools,
         model,
         corpus,
         previous_response_id,
@@ -313,29 +317,58 @@ pub fn translate_stream(
         );
 
         for (rel_idx, (_, tc)) in tool_calls.iter().enumerate() {
-            let fc_item_id = format!("fc_{}", uuid::Uuid::new_v4().simple());
             let output_index = base_index + rel_idx;
             let (namespace, name) = response_function_name_for_responses(&tc.name, &namespace_tools);
-            let mut added_item = json!({
-                "type": "function_call",
-                "id": &fc_item_id,
-                "call_id": &tc.id,
-                "name": &name,
-                "arguments": "",
-                "status": "in_progress"
-            });
-            let mut done_item = json!({
-                "type": "function_call",
-                "id": &fc_item_id,
-                "call_id": &tc.id,
-                "name": &name,
-                "arguments": &tc.arguments,
-                "status": "completed"
-            });
-            if let Some(namespace) = namespace {
-                added_item["namespace"] = Value::String(namespace.clone());
-                done_item["namespace"] = Value::String(namespace);
-            }
+            let custom = custom_tools.get(&tc.name);
+            let fc_item_id = if custom.is_some() {
+                format!("ctc_{}", uuid::Uuid::new_v4().simple())
+            } else {
+                format!("fc_{}", uuid::Uuid::new_v4().simple())
+            };
+            let custom_input = custom
+                .map(|tool| custom_tool_input(&tc.arguments, &tool.argument_field));
+            let (added_item, done_item) = if let (Some(custom), Some(input)) = (custom, custom_input.as_deref()) {
+                (
+                    json!({
+                        "type": "custom_tool_call",
+                        "id": &fc_item_id,
+                        "call_id": &tc.id,
+                        "name": &custom.name,
+                        "input": "",
+                        "status": "in_progress"
+                    }),
+                    json!({
+                        "type": "custom_tool_call",
+                        "id": &fc_item_id,
+                        "call_id": &tc.id,
+                        "name": &custom.name,
+                        "input": input,
+                        "status": "completed"
+                    }),
+                )
+            } else {
+                let mut added = json!({
+                    "type": "function_call",
+                    "id": &fc_item_id,
+                    "call_id": &tc.id,
+                    "name": &name,
+                    "arguments": "",
+                    "status": "in_progress"
+                });
+                let mut done = json!({
+                    "type": "function_call",
+                    "id": &fc_item_id,
+                    "call_id": &tc.id,
+                    "name": &name,
+                    "arguments": &tc.arguments,
+                    "status": "completed"
+                });
+                if let Some(namespace) = namespace {
+                    added["namespace"] = Value::String(namespace.clone());
+                    done["namespace"] = Value::String(namespace);
+                }
+                (added, done)
+            };
 
             yield Ok(Event::default()
                 .event("response.output_item.added")
@@ -345,7 +378,18 @@ pub fn translate_stream(
                     "item": added_item
                 }).to_string()));
 
-            if !tc.arguments.is_empty() {
+            if let Some(input) = custom_input.as_deref() {
+                if !input.is_empty() {
+                    yield Ok(Event::default()
+                        .event("response.custom_tool_call_input.delta")
+                        .data(json!({
+                            "type": "response.custom_tool_call_input.delta",
+                            "item_id": &fc_item_id,
+                            "output_index": output_index,
+                            "delta": input
+                        }).to_string()));
+                }
+            } else if !tc.arguments.is_empty() {
                 yield Ok(Event::default()
                     .event("response.function_call_arguments.delta")
                     .data(json!({

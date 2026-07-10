@@ -617,6 +617,7 @@ async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Respo
 
     let model = req.model.clone();
     let namespace_tools = translate::namespace_tool_map(&req.tools);
+    let custom_tools = translate::custom_tool_map(&req.tools);
     let mut chat_req = translate::to_chat_request(&req, history, &state.sessions);
     debug!(
         "→ upstream tools={}",
@@ -639,6 +640,7 @@ async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Respo
             sessions: state.sessions,
             request_messages,
             namespace_tools,
+            custom_tools,
             model,
             corpus: state.corpus,
             previous_response_id,
@@ -646,7 +648,16 @@ async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Respo
         .into_response()
     } else {
         chat_req.stream = false;
-        handle_blocking(state, chat_req, url, model, namespace_tools, previous_response_id).await
+        handle_blocking(
+            state,
+            chat_req,
+            url,
+            model,
+            namespace_tools,
+            custom_tools,
+            previous_response_id,
+        )
+        .await
     }
 }
 
@@ -749,6 +760,7 @@ async fn handle_blocking(
     url: String,
     model: String,
     namespace_tools: translate::NamespaceToolMap,
+    custom_tools: translate::CustomToolMap,
     previous_response_id: Option<String>,
 ) -> Response {
     let mut builder = state
@@ -819,14 +831,15 @@ async fn handle_blocking(
                 }
                 state.sessions.save_with_id(response_id.clone(), full_history);
 
-                let (resp, _) = if namespace_tools.is_empty() {
+                let (resp, _) = if namespace_tools.is_empty() && custom_tools.is_empty() {
                     translate::from_chat_response(response_id, &model, chat_resp)
                 } else {
-                    translate::from_chat_response_with_tool_map(
+                    translate::from_chat_response_with_tool_maps(
                         response_id,
                         &model,
                         chat_resp,
                         &namespace_tools,
+                        &custom_tools,
                     )
                 };
                 Json(resp).into_response()

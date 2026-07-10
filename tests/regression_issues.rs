@@ -13,7 +13,8 @@ use axum::{
 };
 use codex_relay::session::SessionStore;
 use codex_relay::translate::{
-    from_chat_response_with_tool_map, namespace_tool_map, to_chat_request,
+    custom_tool_map, from_chat_response_with_tool_map, from_chat_response_with_tool_maps,
+    namespace_tool_map, to_chat_request,
 };
 use codex_relay::types::{ChatChoice, ChatMessage, ChatResponse, ChatUsage, ResponsesRequest};
 use eventsource_stream::Eventsource;
@@ -126,6 +127,65 @@ fn issue_20_blocking_hyphen_flat_tool_name_is_not_namespaced() {
     assert_eq!(resp.output[0]["type"], "function_call");
     assert!(resp.output[0].get("namespace").is_none());
     assert_eq!(resp.output[0]["name"], "foo-bar");
+}
+
+#[test]
+fn issue_37_custom_apply_patch_round_trips_in_blocking_translation() {
+    let tools = vec![json!({
+        "type": "custom",
+        "name": "apply_patch",
+        "description": "Apply a patch"
+    })];
+    let req: ResponsesRequest = serde_json::from_value(json!({
+        "model": "mock-model",
+        "input": "Update the file.",
+        "tools": tools,
+        "stream": false
+    }))
+    .unwrap();
+    let chat_req = to_chat_request(&req, Vec::new(), &SessionStore::new());
+    assert_eq!(chat_req.tools[0]["type"], "function");
+    assert_eq!(chat_req.tools[0]["function"]["name"], "apply_patch");
+    assert_eq!(
+        chat_req.tools[0]["function"]["parameters"]["required"],
+        json!(["patch"])
+    );
+
+    let patch = "*** Begin Patch\n*** Update File: test.txt\n@@\n-old\n+new\n*** End Patch";
+    let chat = ChatResponse {
+        choices: vec![ChatChoice {
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![json!({
+                    "id": "call_patch",
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "arguments": json!({"patch": patch}).to_string()
+                    }
+                })]),
+                tool_call_id: None,
+                name: None,
+            },
+        }],
+        usage: None,
+    };
+    let custom_tools = custom_tool_map(&req.tools);
+    let (response, _) = from_chat_response_with_tool_maps(
+        "resp_37".into(),
+        "mock-model",
+        chat,
+        &Default::default(),
+        &custom_tools,
+    );
+    let item = &response.output[0];
+    assert_eq!(item["type"], "custom_tool_call");
+    assert_eq!(item["name"], "apply_patch");
+    assert_eq!(item["call_id"], "call_patch");
+    assert_eq!(item["input"], patch);
+    assert!(item.get("arguments").is_none());
 }
 
 #[test]
@@ -866,6 +926,93 @@ async fn issue_20_streaming_hyphen_flat_tool_name_is_not_namespaced() {
     let item = &completed["response"]["output"][0];
     assert!(item.get("namespace").is_none());
     assert_eq!(item["name"], "foo-bar");
+}
+
+#[tokio::test]
+async fn issue_37_streaming_apply_patch_emits_custom_tool_events() {
+    let patch = "*** Begin Patch\n*** Update File: test.txt\n@@\n-old\n+new\n*** End Patch";
+    let arguments = json!({"patch": patch}).to_string();
+    let tool_sse = sse_from_chunks(vec![
+        json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_patch",
+                        "function": {
+                            "name": "apply_patch",
+                            "arguments": arguments
+                        }
+                    }]
+                }
+            }]
+        }),
+        json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}),
+    ]);
+    let (upstream_port, bodies) = spawn_mock_upstream_with_responses(vec![tool_sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({
+            "model": "mock-model",
+            "input": "Apply the change.",
+            "tools": [{
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch"
+            }],
+            "stream": true
+        }),
+    )
+    .await;
+
+    let added = events
+        .iter()
+        .find(|(event, data)| {
+            event == "response.output_item.added" && data["item"]["type"] == "custom_tool_call"
+        })
+        .map(|(_, data)| &data["item"])
+        .expect("custom_tool_call added item");
+    assert_eq!(added["name"], "apply_patch");
+    assert_eq!(added["input"], "");
+    assert!(added.get("arguments").is_none());
+
+    let delta = events
+        .iter()
+        .find(|(event, _)| event == "response.custom_tool_call_input.delta")
+        .map(|(_, data)| data)
+        .expect("custom tool input delta");
+    assert_eq!(delta["delta"], patch);
+
+    let done = events
+        .iter()
+        .find(|(event, data)| {
+            event == "response.output_item.done" && data["item"]["type"] == "custom_tool_call"
+        })
+        .map(|(_, data)| &data["item"])
+        .expect("custom_tool_call done item");
+    assert_eq!(done["input"], patch);
+
+    let completed = events
+        .iter()
+        .find_map(|(event, data)| (event == "response.completed").then_some(data))
+        .expect("response.completed");
+    assert_eq!(
+        completed["response"]["output"][0]["type"],
+        "custom_tool_call"
+    );
+    assert_eq!(completed["response"]["output"][0]["input"], patch);
+
+    let request_bodies = bodies.lock().unwrap();
+    assert_eq!(
+        request_bodies[0]["tools"][0]["function"]["name"],
+        "apply_patch"
+    );
+    assert_eq!(
+        request_bodies[0]["tools"][0]["function"]["parameters"]["required"],
+        json!(["patch"])
+    );
 }
 
 #[tokio::test]

@@ -266,6 +266,14 @@ async fn chat_handler(State(state): State<MockState>, req: axum::extract::Reques
         .unwrap()
 }
 
+async fn delayed_chat_handler(
+    State(state): State<MockState>,
+    req: axum::extract::Request,
+) -> Response {
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    chat_handler(State(state), req).await
+}
+
 fn sse_from_chunks(chunks: Vec<Value>) -> String {
     let mut sse = String::new();
     for chunk in chunks {
@@ -301,6 +309,21 @@ async fn spawn_mock_upstream() -> (u16, Arc<Mutex<Vec<Value>>>) {
 async fn spawn_mock_upstream_with_responses(
     responses: Vec<String>,
 ) -> (u16, Arc<Mutex<Vec<Value>>>) {
+    spawn_mock_upstream_with_chat_handler(responses, chat_handler).await
+}
+
+async fn spawn_delayed_mock_upstream() -> (u16, Arc<Mutex<Vec<Value>>>) {
+    spawn_mock_upstream_with_chat_handler(Vec::new(), delayed_chat_handler).await
+}
+
+async fn spawn_mock_upstream_with_chat_handler<H, T>(
+    responses: Vec<String>,
+    handler: H,
+) -> (u16, Arc<Mutex<Vec<Value>>>)
+where
+    H: axum::handler::Handler<T, MockState>,
+    T: 'static,
+{
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let state = MockState {
         bodies: bodies.clone(),
@@ -308,7 +331,7 @@ async fn spawn_mock_upstream_with_responses(
     };
     let app = Router::new()
         .route("/v1/models", get(models_handler))
-        .route("/v1/chat/completions", post(chat_handler))
+        .route("/v1/chat/completions", post(handler))
         .with_state(state);
     // Bind to port 0 and keep the listener so the OS-assigned port cannot be
     // grabbed by a concurrently running test (avoids a bind/drop/rebind race).
@@ -453,6 +476,48 @@ impl Relay {
     fn url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{}", self.port, path)
     }
+}
+
+#[tokio::test]
+async fn issue_40_streaming_headers_and_keepalive_do_not_wait_for_upstream_headers() {
+    let (upstream_port, _bodies) = spawn_delayed_mock_upstream().await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        reqwest::Client::new()
+            .post(relay.url("/v1/responses"))
+            .json(&json!({
+                "model": "mock-model",
+                "input": "Wait for the upstream.",
+                "tools": [],
+                "stream": true
+            }))
+            .send(),
+    )
+    .await
+    .expect("relay should flush streaming response headers immediately")
+    .expect("POST /v1/responses");
+    assert!(response.status().is_success());
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+
+    let mut chunks = response.bytes_stream();
+    let first = tokio::time::timeout(Duration::from_secs(1), chunks.next())
+        .await
+        .expect("response.created should arrive immediately")
+        .expect("response.created chunk")
+        .expect("response.created bytes");
+    assert!(String::from_utf8_lossy(&first).contains("response.created"));
+
+    let keepalive = tokio::time::timeout(Duration::from_secs(6), chunks.next())
+        .await
+        .expect("keepalive should arrive before delayed upstream headers")
+        .expect("keepalive chunk")
+        .expect("keepalive bytes");
+    assert_eq!(keepalive.as_ref(), b": keepalive\n\n");
 }
 
 #[tokio::test]

@@ -8,6 +8,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -537,5 +538,9 @@ pub fn translate_stream(
         }
     };
 
-    Sse::new(event_stream).keep_alive(KeepAlive::default())
+    Sse::new(event_stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(5))
+            .text("keepalive"),
+    )
 }

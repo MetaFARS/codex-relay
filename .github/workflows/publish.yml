@@ -8,14 +8,6 @@ permissions:
   contents: read
 
 jobs:
-  # ── crates.io ─────────────────────────────────────────────────────────────
-  publish-crates:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo publish --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
   # ── PyPI wheels (multi-platform via maturin-action) ───────────────────────
   build-wheels:
     name: wheel ${{ matrix.platform.artifact }}
@@ -39,6 +31,7 @@ jobs:
             test_image: quay.io/pypa/manylinux2014_aarch64
             python_command: /opt/python/cp311-cp311/bin/python
             binary_command: /opt/python/cp311-cp311/bin/codex-relay
+            cflags: -D__ARM_ARCH=8
           - runner: ubuntu-22.04
             target: x86_64
             manylinux: musllinux_1_2
@@ -81,6 +74,8 @@ jobs:
         uses: docker/setup-qemu-action@v3
       - name: Build wheel
         uses: PyO3/maturin-action@v1
+        env:
+          CFLAGS_aarch64_unknown_linux_gnu: ${{ matrix.platform.cflags }}
         with:
           command: build
           args: --release --out dist
@@ -158,6 +153,14 @@ jobs:
         with:
           name: wheels-sdist
           path: dist
+
+  publish-crates:
+    needs: [build-wheels, windows-python-smoke, build-sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo publish --locked --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   publish-pypi:
     needs: [build-wheels, windows-python-smoke, build-sdist]

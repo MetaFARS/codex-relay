@@ -58,6 +58,9 @@ pub fn to_chat_request(
             });
         }
         ResponsesInput::Messages(items) => {
+            // Request-scoped custom tool map so replayed custom_tool_call items
+            // are wrapped with the same argument field the tool declared.
+            let custom_tools = custom_tool_map(&req.tools);
             // Collect call_ids already present in history (from previous_response_id).
             // This prevents creating duplicate assistant-with-tool_calls messages
             // when the input items replay function_call entries from prior output.
@@ -114,7 +117,11 @@ pub fn to_chat_request(
                         let name = response_function_name_for_chat(cur);
                         let args = if cur_type == "custom_tool_call" {
                             let input = cur.get("input").and_then(Value::as_str).unwrap_or("");
-                            json!({ custom_argument_field(&name): input }).to_string()
+                            let argument_field = custom_tools
+                                .get(&name)
+                                .map(|tool| tool.argument_field.as_str())
+                                .unwrap_or_else(|| custom_argument_field(&name));
+                            json!({ argument_field: input }).to_string()
                         } else {
                             cur.get("arguments")
                                 .and_then(Value::as_str)
@@ -222,8 +229,10 @@ pub fn to_chat_request(
     // enabled; its default auto-thinking is suppressed by heavy agent system
     // prompts (e.g. Codex). Other providers (DeepSeek/Kimi) think by default and
     // must not receive this field, so it stays GLM-gated to preserve their
-    // request shape. See GitHub issue #26.
-    let enable_glm_thinking = is_glm_like_model(&req.model) || is_glm_like_model(&mapped_model);
+    // request shape. See GitHub issue #26 and the quirk registry in quirks.rs.
+    let enable_glm_thinking = crate::quirks::quirk_enabled("glm_thinking")
+        && (crate::quirks::is_glm_like_model(&req.model)
+            || crate::quirks::is_glm_like_model(&mapped_model));
 
     ChatRequest {
         model: mapped_model,
@@ -239,13 +248,6 @@ pub fn to_chat_request(
         }),
         stream: req.stream,
     }
-}
-
-/// Whether a model name looks like a GLM/Zhipu reasoning model that needs the
-/// explicit `thinking` switch to emit reasoning_content.
-fn is_glm_like_model(model: &str) -> bool {
-    let m = model.to_ascii_lowercase();
-    m.contains("glm") || m.contains("zhipu") || m.contains("bigmodel")
 }
 
 /// Map model names via `CODEX_RELAY_MODEL_MAP` env var.
@@ -311,18 +313,40 @@ pub fn namespace_tool_map(tools: &[Value]) -> NamespaceToolMap {
 pub fn custom_tool_map(tools: &[Value]) -> CustomToolMap {
     tools
         .iter()
-        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("custom"))
         .filter_map(|tool| {
+            let tool_type = tool.get("type").and_then(Value::as_str)?;
             let name = tool.get("name").and_then(Value::as_str)?;
+            let argument_field = match tool_type {
+                "custom" => custom_argument_field(name).to_string(),
+                // Codex CLI declares `apply_patch` as a plain function tool in
+                // some configurations (issue #37), but its handler only accepts
+                // `custom_tool_call` items, so treat it as custom by name. The
+                // argument field follows the declared schema (`patch` in recent
+                // Codex CLI, `input` in the historical JSON tool variant).
+                "function" if name == "apply_patch" => function_tool_string_field(tool)
+                    .unwrap_or_else(|| custom_argument_field(name).to_string()),
+                _ => return None,
+            };
             Some((
                 name.to_string(),
                 CustomToolName {
                     name: name.to_string(),
-                    argument_field: custom_argument_field(name).to_string(),
+                    argument_field,
                 },
             ))
         })
         .collect()
+}
+
+/// If a Responses API function tool takes a single string parameter, return
+/// that parameter's name.
+fn function_tool_string_field(tool: &Value) -> Option<String> {
+    let properties = tool.get("parameters")?.get("properties")?.as_object()?;
+    if properties.len() != 1 {
+        return None;
+    }
+    let (field, schema) = properties.iter().next()?;
+    (schema.get("type").and_then(Value::as_str) == Some("string")).then(|| field.clone())
 }
 
 fn custom_argument_field(name: &str) -> &'static str {
@@ -514,7 +538,7 @@ pub fn from_chat_response_with_tool_maps(
     namespace_tools: &NamespaceToolMap,
     custom_tools: &CustomToolMap,
 ) -> (ResponsesResponse, Vec<ChatMessage>) {
-    let choice = chat
+    let mut choice = chat
         .choices
         .into_iter()
         .next()
@@ -528,6 +552,14 @@ pub fn from_chat_response_with_tool_maps(
                 name: None,
             },
         });
+
+    // DeepSeek V4 intermittently leaks DSML tool-call markup into the text
+    // content instead of structured tool_calls; heal it before translation
+    // so the calls execute and the markup never reaches Codex or history.
+    // Quirk `dsml_heal`, see quirks.rs.
+    if crate::quirks::quirk_enabled("dsml_heal") {
+        crate::dsml::heal_chat_message(&mut choice.message);
+    }
 
     let usage = chat.usage.unwrap_or_default();
     tracing::debug!("cache(non-stream): {}", usage.cache_summary());

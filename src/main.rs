@@ -1,4 +1,6 @@
 mod corpus;
+mod dsml;
+mod quirks;
 mod session;
 mod stream;
 mod translate;

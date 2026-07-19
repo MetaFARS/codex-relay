@@ -140,6 +140,7 @@ codex-relay --upstream https://api.deepseek.com/v1 --api-key "$DEEPSEEK_API_KEY"
 | `CODEX_RELAY_DROP_PARAMS` | _(empty)_ | JSON array of top-level upstream request parameter names to remove before forwarding |
 | `CODEX_RELAY_MODEL_MAP` | _(empty)_ | Comma-separated `source:target` model name translations (e.g., `gpt-5.4:deepseek-v4-pro`) |
 | `CODEX_RELAY_TOOL_DENYLIST` | _(empty)_ | Comma-separated tool names to remove before forwarding tools to the upstream model |
+| `CODEX_RELAY_DISABLE_QUIRKS` | _(empty)_ | Comma-separated [platform quirk](#platform-quirks) names to disable (e.g. `dsml_heal,glm_thinking`) |
 | `CODEX_RELAY_SESSION_TTL_HOURS` | `168` | Retain idle session/reasoning state for this many hours |
 | `CODEX_RELAY_MAX_SESSIONS` | `256` | Maximum completed response histories retained for `previous_response_id` |
 | `CODEX_RELAY_MAX_SESSION_MEMORY_MB` | `512` | Approximate memory budget for retained session/reasoning state |
@@ -147,6 +148,22 @@ codex-relay --upstream https://api.deepseek.com/v1 --api-key "$DEEPSEEK_API_KEY"
 | `CODEX_RELAY_HISTORY_DIR` | `.codex-relay-history` | Directory for disk-backed history records |
 | `CODEX_RELAY_RECORD_CORPUS` | _(off)_ | Directory to append per-turn conversation records (OpenAI messages JSONL); off unless set |
 | `RUST_LOG` | `codex_relay=info` | Log verbosity |
+
+## Platform quirks
+
+Some providers need workarounds that are not part of the Responses ⇄ Chat Completions translation itself. These are registered as named quirks (see `src/quirks.rs` for the full registry, triggers, and removal criteria):
+
+| Quirk | Kind | What it does |
+|---|---|---|
+| `glm_thinking` | request-shaping | Sends `thinking: enabled` for GLM/Zhipu models so they emit `reasoning_content` (issue #26) |
+| `dsml_heal` | response-healing | Parses DeepSeek V4's intermittently leaked DSML tool-call markup in text content back into structured tool calls |
+| `missing_done` | response-healing | Treats a cleanly closed SSE stream without `[DONE]` as complete when a full turn was received (issue #31) |
+
+Response-healing quirks activate only when the anomaly is detected and log a `quirk <name> fired` warning each time, so you can tell from the logs whether a workaround is still needed. Once the platform fixes the underlying bug, disable a quirk immediately with:
+
+```bash
+CODEX_RELAY_DISABLE_QUIRKS=dsml_heal codex-relay
+```
 
 ## Python API
 

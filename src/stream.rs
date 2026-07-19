@@ -13,6 +13,7 @@ use tracing::{debug, error, warn};
 
 use crate::{
     corpus::CorpusRecorder,
+    dsml::{synthesize_call_id, DsmlStreamFilter},
     session::SessionStore,
     translate::{
         custom_tool_input, response_function_name_for_responses, CustomToolMap, NamespaceToolMap,
@@ -134,6 +135,10 @@ pub fn translate_stream(
 
         let mut accumulated_text = String::new();
         let mut accumulated_reasoning = String::new();
+        // Withholds text that could be leaked DeepSeek DSML tool-call markup
+        // and heals it into structured tool calls at end of stream.
+        // Quirk `dsml_heal`, see quirks.rs.
+        let mut dsml_filter = DsmlStreamFilter::new(crate::quirks::quirk_enabled("dsml_heal"));
         let mut reasoning_chunks: usize = 0;
         let mut tool_calls: BTreeMap<usize, ToolCallAccum> = BTreeMap::new();
         let mut reasoning_output_index: Option<usize> = None;
@@ -204,8 +209,8 @@ pub fn translate_stream(
                                     }
                                 }
 
-                                // Text content
-                                let content = choice.delta.content.as_deref().unwrap_or("");
+                                // Text content, filtered for leaked DSML markup.
+                                let content = dsml_filter.push(choice.delta.content.as_deref().unwrap_or(""));
                                 if !content.is_empty() {
                                     let output_index = match message_output_index {
                                         Some(idx) => idx,
@@ -229,14 +234,14 @@ pub fn translate_stream(
                                             idx
                                         }
                                     };
-                                    accumulated_text.push_str(content);
+                                    accumulated_text.push_str(&content);
                                     yield Ok(Event::default()
                                         .event("response.output_text.delta")
                                         .data(json!({
                                             "type": "response.output_text.delta",
                                             "item_id": &msg_item_id,
                                             "output_index": output_index,
-                                            "delta": content
+                                            "delta": &content
                                         }).to_string()));
                                 }
 
@@ -269,6 +274,58 @@ pub fn translate_stream(
                         }
                     }
                 }
+            }
+        }
+
+        // Flush the DSML filter: healed tool calls join the accumulated
+        // tool_calls (and are emitted as function_call/custom_tool_call items
+        // below); any remaining visible text is emitted as a final delta.
+        let (dsml_leftover, dsml_calls) = dsml_filter.finish();
+        if !dsml_leftover.is_empty() {
+            let output_index = match message_output_index {
+                Some(idx) => idx,
+                None => {
+                    let idx = next_output_index;
+                    next_output_index += 1;
+                    message_output_index = Some(idx);
+                    yield Ok(Event::default()
+                        .event("response.output_item.added")
+                        .data(json!({
+                            "type": "response.output_item.added",
+                            "output_index": idx,
+                            "item": {
+                                "type": "message",
+                                "id": &msg_item_id,
+                                "role": "assistant",
+                                "status": "in_progress",
+                                "content": []
+                            }
+                        }).to_string()));
+                    idx
+                }
+            };
+            accumulated_text.push_str(&dsml_leftover);
+            yield Ok(Event::default()
+                .event("response.output_text.delta")
+                .data(json!({
+                    "type": "response.output_text.delta",
+                    "item_id": &msg_item_id,
+                    "output_index": output_index,
+                    "delta": &dsml_leftover
+                }).to_string()));
+        }
+        if !dsml_calls.is_empty() {
+            warn!(
+                "quirk dsml_heal fired: healed {} leaked DSML tool call(s) from stream",
+                dsml_calls.len()
+            );
+            let base_index = tool_calls.keys().max().map(|idx| idx + 1).unwrap_or(0);
+            for (offset, call) in dsml_calls.into_iter().enumerate() {
+                tool_calls.insert(base_index + offset, ToolCallAccum {
+                    id: synthesize_call_id(),
+                    name: call.name,
+                    arguments: call.arguments,
+                });
             }
         }
 
@@ -418,8 +475,12 @@ pub fn translate_stream(
         // (text and/or tool calls), treat it as complete so the response is
         // persisted and `response.completed` is emitted. A mid-stream error
         // (stream_err) still discards the partial turn.
-        if !stream_done && !stream_err && (!accumulated_text.is_empty() || !tool_calls.is_empty()) {
-            warn!("stream ended without [DONE] but content was received — treating as complete");
+        if !stream_done
+            && !stream_err
+            && (!accumulated_text.is_empty() || !tool_calls.is_empty())
+            && crate::quirks::quirk_enabled("missing_done")
+        {
+            warn!("quirk missing_done fired: stream ended without [DONE] but content was received — treating as complete");
             stream_done = true;
         }
 

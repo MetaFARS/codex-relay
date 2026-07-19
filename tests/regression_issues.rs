@@ -189,6 +189,309 @@ fn issue_37_custom_apply_patch_round_trips_in_blocking_translation() {
 }
 
 #[test]
+fn issue_37_function_declared_apply_patch_emits_custom_tool_call() {
+    // Codex CLI declares apply_patch as a plain function tool in some
+    // configurations, but still requires custom_tool_call items back.
+    let tools = vec![json!({
+        "type": "function",
+        "name": "apply_patch",
+        "description": "Use the `apply_patch` tool to edit files. This is a FREEFORM tool...",
+        "parameters": {
+            "type": "object",
+            "properties": { "patch": { "type": "string" } },
+            "required": ["patch"]
+        }
+    })];
+    let req: ResponsesRequest = serde_json::from_value(json!({
+        "model": "mock-model",
+        "input": "Update the file.",
+        "tools": tools,
+        "stream": false
+    }))
+    .unwrap();
+    // The declared function schema passes through to the upstream request.
+    let chat_req = to_chat_request(&req, Vec::new(), &SessionStore::new());
+    assert_eq!(chat_req.tools[0]["function"]["name"], "apply_patch");
+    assert_eq!(
+        chat_req.tools[0]["function"]["parameters"]["required"],
+        json!(["patch"])
+    );
+
+    let patch = "*** Begin Patch\n*** Update File: test.txt\n@@\n-old\n+new\n*** End Patch";
+    let chat = ChatResponse {
+        choices: vec![ChatChoice {
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![json!({
+                    "id": "call_patch_fn",
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "arguments": json!({"patch": patch}).to_string()
+                    }
+                })]),
+                tool_call_id: None,
+                name: None,
+            },
+        }],
+        usage: None,
+    };
+    let custom_tools = custom_tool_map(&req.tools);
+    let (response, _) = from_chat_response_with_tool_maps(
+        "resp_37_fn".into(),
+        "mock-model",
+        chat,
+        &Default::default(),
+        &custom_tools,
+    );
+    let item = &response.output[0];
+    assert_eq!(item["type"], "custom_tool_call");
+    assert_eq!(item["name"], "apply_patch");
+    assert_eq!(item["call_id"], "call_patch_fn");
+    assert_eq!(item["input"], patch);
+    assert!(item.get("arguments").is_none());
+}
+
+#[test]
+fn issue_37_function_declared_apply_patch_respects_input_argument_field() {
+    // Historical Codex CLI versions declared the JSON apply_patch variant
+    // with a single required `input` string parameter.
+    let tools = vec![json!({
+        "type": "function",
+        "name": "apply_patch",
+        "parameters": {
+            "type": "object",
+            "properties": { "input": { "type": "string" } },
+            "required": ["input"]
+        }
+    })];
+    let patch = "*** Begin Patch\n*** Update File: a.txt\n@@\n-x\n+y\n*** End Patch";
+    let chat = ChatResponse {
+        choices: vec![ChatChoice {
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![json!({
+                    "id": "call_patch_input",
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "arguments": json!({"input": patch}).to_string()
+                    }
+                })]),
+                tool_call_id: None,
+                name: None,
+            },
+        }],
+        usage: None,
+    };
+    let custom_tools = custom_tool_map(&tools);
+    let (response, _) = from_chat_response_with_tool_maps(
+        "resp_37_input".into(),
+        "mock-model",
+        chat,
+        &Default::default(),
+        &custom_tools,
+    );
+    let item = &response.output[0];
+    assert_eq!(item["type"], "custom_tool_call");
+    assert_eq!(item["input"], patch);
+
+    // The next-turn replay wraps the raw input back using the declared field.
+    let req: ResponsesRequest = serde_json::from_value(json!({
+        "model": "mock-model",
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_patch_input",
+                "name": "apply_patch",
+                "input": patch
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_patch_input",
+                "output": "Done"
+            }
+        ],
+        "tools": tools,
+        "stream": false
+    }))
+    .unwrap();
+    let chat_req = to_chat_request(&req, Vec::new(), &SessionStore::new());
+    let assistant = chat_req
+        .messages
+        .iter()
+        .find(|msg| msg.tool_calls.is_some())
+        .expect("assistant tool call message");
+    let args = assistant.tool_calls.as_ref().unwrap()[0]["function"]["arguments"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(args).unwrap(),
+        json!({"input": patch})
+    );
+}
+
+#[test]
+fn dsml_leak_blocking_response_heals_into_function_call() {
+    // DeepSeek V4 intermittently returns tool calls as raw DSML markup in
+    // content instead of structured tool_calls. The relay must heal them.
+    let dsml = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"shell\">\n<｜DSML｜parameter name=\"command\" string=\"true\">Get-Content 'D:\\2026年\\病毒学\\data.csv' -Encoding UTF8 -TotalCount 5</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+    let chat = ChatResponse {
+        choices: vec![ChatChoice {
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: Some(Value::String(format!("我来逐步完成这个任务。\n{dsml}"))),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+        }],
+        usage: None,
+    };
+    let (response, history) = from_chat_response_with_tool_map(
+        "resp_dsml".into(),
+        "deepseek-v4-pro",
+        chat,
+        &Default::default(),
+    );
+
+    assert_eq!(response.output[0]["type"], "message");
+    assert_eq!(
+        response.output[0]["content"][0]["text"],
+        "我来逐步完成这个任务。"
+    );
+    let call = &response.output[1];
+    assert_eq!(call["type"], "function_call");
+    assert_eq!(call["name"], "shell");
+    let args: Value = serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        args["command"],
+        "Get-Content 'D:\\2026年\\病毒学\\data.csv' -Encoding UTF8 -TotalCount 5"
+    );
+
+    // Session history must store the healed message, not the raw markup.
+    assert_eq!(history[0].text_content(), "我来逐步完成这个任务。");
+    assert_eq!(history[0].tool_calls.as_ref().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn dsml_leak_streaming_heals_into_function_call_events() {
+    // Leaked DSML arrives as ordinary content deltas, with markers split
+    // across chunk boundaries. The relay must withhold the markup from
+    // output_text deltas and emit healed function_call events instead.
+    let dsml_sse = sse_from_chunks(vec![
+        json!({"choices": [{"delta": {"content": "我来读取文件。"}}]}),
+        json!({"choices": [{"delta": {"content": "<｜DS"}}]}),
+        json!({"choices": [{"delta": {"content": "ML｜tool_calls>\n<｜DSML｜invoke name=\"shell\">\n"}}]}),
+        json!({"choices": [{"delta": {"content": "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la</｜DSML｜parameter>\n</｜DSML｜invoke>\n"}}]}),
+        json!({"choices": [{"delta": {"content": "</｜DSML｜tool_calls>"}}]}),
+        json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}),
+    ]);
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![dsml_sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({
+            "model": "mock-model",
+            "input": "读取文件",
+            "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            "stream": true
+        }),
+    )
+    .await;
+
+    // No DSML markup may leak into visible text deltas.
+    for (event, data) in &events {
+        if event == "response.output_text.delta" {
+            let delta = data["delta"].as_str().unwrap();
+            assert!(!delta.contains("DSML"), "DSML leaked into delta: {delta}");
+        }
+    }
+
+    let fc_done = events
+        .iter()
+        .find(|(event, data)| {
+            event == "response.output_item.done" && data["item"]["type"] == "function_call"
+        })
+        .map(|(_, data)| &data["item"])
+        .expect("healed function_call done item");
+    assert_eq!(fc_done["name"], "shell");
+    let args: Value = serde_json::from_str(fc_done["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args["command"], "ls -la");
+    assert!(fc_done["call_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("call_dsml_"));
+
+    let completed = events
+        .iter()
+        .find_map(|(event, data)| (event == "response.completed").then_some(data))
+        .expect("response.completed");
+    let output = completed["response"]["output"].as_array().unwrap();
+    let message = output
+        .iter()
+        .find(|item| item["type"] == "message")
+        .unwrap();
+    assert_eq!(
+        message["content"][0]["text"], "我来读取文件。",
+        "final message text must not contain DSML markup"
+    );
+    assert!(
+        output.iter().any(|item| item["type"] == "function_call"),
+        "completed output must include the healed function_call"
+    );
+}
+
+#[tokio::test]
+async fn dsml_heal_quirk_can_be_disabled_via_env() {
+    // CODEX_RELAY_DISABLE_QUIRKS is the per-quirk kill switch: with dsml_heal
+    // disabled the markup must pass through as plain text, untouched.
+    let dsml_sse = sse_from_chunks(vec![
+        json!({"choices": [{"delta": {"content": "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"shell\">\n<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"}}]}),
+        json!({"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}),
+    ]);
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![dsml_sse]).await;
+    let relay = Relay::spawn_with_env(
+        &format!("http://127.0.0.1:{upstream_port}/v1"),
+        &[("CODEX_RELAY_DISABLE_QUIRKS", "dsml_heal")],
+    );
+
+    let events = post_stream_events(
+        &relay,
+        json!({
+            "model": "mock-model",
+            "input": "读取文件",
+            "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            "stream": true
+        }),
+    )
+    .await;
+
+    assert!(
+        !events
+            .iter()
+            .any(|(event, data)| event == "response.output_item.done"
+                && data["item"]["type"] == "function_call"),
+        "disabled quirk must not synthesize function_call items"
+    );
+    let text: String = events
+        .iter()
+        .filter(|(event, _)| event == "response.output_text.delta")
+        .map(|(_, data)| data["delta"].as_str().unwrap())
+        .collect();
+    assert!(
+        text.contains("<｜DSML｜tool_calls>"),
+        "markup should pass through untouched when the quirk is disabled"
+    );
+}
+
+#[test]
 fn blocking_response_usage_includes_cached_tokens() {
     let chat = ChatResponse {
         choices: vec![ChatChoice {

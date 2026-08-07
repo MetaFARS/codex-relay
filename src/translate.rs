@@ -561,6 +561,14 @@ pub fn from_chat_response_with_tool_maps(
         crate::dsml::heal_chat_message(&mut choice.message);
     }
 
+    // Reasoning models served without a vLLM reasoning parser leak `<think>`
+    // markup into the text content instead of `reasoning_content`; split it out
+    // so Codex never renders it and history never replays it.
+    // Quirk `think_tags`, see quirks.rs.
+    if crate::quirks::quirk_enabled("think_tags") {
+        crate::think::heal_chat_message(&mut choice.message);
+    }
+
     let usage = chat.usage.unwrap_or_default();
     tracing::debug!("cache(non-stream): {}", usage.cache_summary());
     let mut output = Vec::new();

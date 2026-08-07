@@ -34,12 +34,13 @@
 //! |----------------|-------|-------------------------------------------|-------------|
 //! | `glm_thinking` | A     | model name looks like GLM/Zhipu           | GLM emits reasoning_content without the explicit `thinking` switch (issue #26) |
 //! | `dsml_heal`    | B     | leaked `<｜DSML｜` markup in text content  | DeepSeek V4 stops leaking DSML (vllm-project/vllm#40801) and telemetry shows no firings for ~a month |
-//! | `missing_done` | B     | SSE stream closes cleanly without `[DONE]`| providers (e.g. synthetic.new) terminate streams spec-compliantly (issue #31) |
+//! | `missing_done` | B     | SSE stream closes cleanly without `[DONE]`| providers terminate streams spec-compliantly (issue #31) |
+//! | `think_tags`   | B     | `<think>` markup leaked into text content  | providers deploy reasoning models with a matching vLLM `--reasoning-parser` so thinking arrives in `reasoning_content` |
 
 use std::collections::HashSet;
 
 /// Names of all registered quirks, for validation and documentation.
-pub const QUIRK_NAMES: &[&str] = &["glm_thinking", "dsml_heal", "missing_done"];
+pub const QUIRK_NAMES: &[&str] = &["glm_thinking", "dsml_heal", "missing_done", "think_tags"];
 
 /// Whether a quirk is enabled, honoring the `CODEX_RELAY_DISABLE_QUIRKS`
 /// kill switch (comma-separated quirk names, case-insensitive).

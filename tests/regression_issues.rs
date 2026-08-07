@@ -598,6 +598,19 @@ fn sse_from_chunks_without_done(chunks: Vec<Value>) -> String {
     sse
 }
 
+/// `[DONE]` present but not terminated by a blank line, exactly as
+/// synthetic.new sends it (`...}}\n\ndata: [DONE]<EOF>`).
+fn sse_from_chunks_unterminated_done(chunks: Vec<Value>) -> String {
+    let mut sse = String::new();
+    for chunk in chunks {
+        sse.push_str("data: ");
+        sse.push_str(&chunk.to_string());
+        sse.push_str("\n\n");
+    }
+    sse.push_str("data: [DONE]");
+    sse
+}
+
 fn default_ok_sse() -> String {
     sse_from_chunks(vec![
         json!({"choices":[{"delta":{"role":"assistant","content":"OK"}}]}),
@@ -997,12 +1010,11 @@ async fn issue_26_non_glm_model_does_not_send_thinking() {
 
 #[tokio::test]
 async fn issue_31_stream_without_done_still_completes_when_content_received() {
-    // Some OpenAI-compatible providers (e.g. synthetic.new) close the SSE stream
-    // cleanly without ever sending a terminating `[DONE]` line. A turn that
-    // received content should still complete rather than be discarded.
+    // A provider that closes the SSE stream without a terminating `[DONE]`
+    // line, but did send `finish_reason`, has delivered a complete turn.
     let no_done_sse = sse_from_chunks_without_done(vec![
         json!({"choices":[{"delta":{"role":"assistant","content":"Hello"}}]}),
-        json!({"choices":[{"delta":{"content":" world"}}]}),
+        json!({"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}),
         json!({"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}),
     ]);
     let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![no_done_sse]).await;
@@ -1018,12 +1030,99 @@ async fn issue_31_stream_without_done_still_completes_when_content_received() {
         .iter()
         .find_map(|(event, data)| (event == "response.completed").then_some(data));
     let failed = events.iter().any(|(event, _)| event == "response.failed");
-    assert!(!failed, "stream should not fail when content was received");
+    assert!(!failed, "stream should not fail when the turn finished");
     let completed = completed.expect("response.completed");
     assert_eq!(
         completed["response"]["output"][0]["content"][0]["text"],
         "Hello world"
     );
+}
+
+#[tokio::test]
+async fn issue_31_unterminated_done_line_is_still_recognized() {
+    // synthetic.new ends the stream with `data: [DONE]` and no trailing
+    // newline. The SSE spec discards an unterminated final event at EOF, so
+    // without an explicit flush `[DONE]` is lost and every turn falls through
+    // to the `missing_done` quirk. Usage from the final chunk must survive too.
+    let sse = sse_from_chunks_unterminated_done(vec![
+        json!({"choices":[{"delta":{"role":"assistant","content":"OK"}}]}),
+        json!({"choices":[{"delta":{},"finish_reason":"stop"}],
+               "usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}),
+    ]);
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({"model": "mock-model", "input": "Say hi.", "tools": [], "stream": true}),
+    )
+    .await;
+
+    let completed = events
+        .iter()
+        .find_map(|(event, data)| (event == "response.completed").then_some(data))
+        .expect("response.completed");
+    assert_eq!(
+        completed["response"]["output"][0]["content"][0]["text"],
+        "OK"
+    );
+    assert_eq!(completed["response"]["usage"]["total_tokens"], 7);
+}
+
+#[tokio::test]
+async fn issue_31_truncated_stream_without_finish_reason_fails() {
+    // No `[DONE]` *and* no `finish_reason`: the connection died mid-generation.
+    // Completing here would persist a half-written turn into session history.
+    let truncated = sse_from_chunks_without_done(vec![
+        json!({"choices":[{"delta":{"role":"assistant","content":"Hel"}}]}),
+    ]);
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![truncated]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({"model": "mock-model", "input": "Say hi.", "tools": [], "stream": true}),
+    )
+    .await;
+
+    assert!(
+        events.iter().any(|(event, _)| event == "response.failed"),
+        "truncated turn must not be reported as completed"
+    );
+}
+
+#[tokio::test]
+async fn think_tags_leaked_into_content_are_routed_to_reasoning() {
+    // vLLM deployments without a `--reasoning-parser` emit chain of thought as
+    // `<think>` markup inside `content`. It must reach Codex as reasoning, not
+    // as assistant text — including when a tag straddles two chunks.
+    let sse = sse_from_chunks(vec![
+        json!({"choices":[{"delta":{"role":"assistant","content":"<thi"}}]}),
+        json!({"choices":[{"delta":{"content":"nk>musing</th"}}]}),
+        json!({"choices":[{"delta":{"content":"ink>\n\nHello!"},"finish_reason":"stop"}]}),
+    ]);
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({"model": "mock-model", "input": "Say hi.", "tools": [], "stream": true}),
+    )
+    .await;
+
+    let text: String = events
+        .iter()
+        .filter(|(event, _)| event == "response.output_text.delta")
+        .filter_map(|(_, data)| data["delta"].as_str())
+        .collect();
+    let reasoning: String = events
+        .iter()
+        .filter(|(event, _)| event == "response.reasoning_summary_text.delta")
+        .filter_map(|(_, data)| data["delta"].as_str())
+        .collect();
+
+    assert_eq!(text, "Hello!", "think markup must not reach visible text");
+    assert_eq!(reasoning, "musing");
 }
 
 #[tokio::test]

@@ -3,6 +3,7 @@ mod dsml;
 mod quirks;
 mod session;
 mod stream;
+mod think;
 mod translate;
 mod types;
 mod upstream_request;

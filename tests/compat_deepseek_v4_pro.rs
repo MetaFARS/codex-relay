@@ -22,6 +22,7 @@ fn base_req(input: ResponsesInput) -> ResponsesRequest {
         max_output_tokens: None,
         system: None,
         instructions: None,
+        reasoning: None,
     }
 }
 

@@ -22,6 +22,20 @@ pub struct ResponsesRequest {
     pub system: Option<String>,
     #[serde(default)]
     pub instructions: Option<String>,
+    /// Responses-API reasoning controls. Codex sends `"reasoning": null` for
+    /// models it believes have no reasoning support, so this must tolerate an
+    /// explicit null as well as a missing key.
+    #[serde(default)]
+    pub reasoning: Option<ResponsesReasoning>,
+}
+
+/// Reasoning block of a Responses request. Only `effort` maps onto Chat
+/// Completions; `summary` has no counterpart there and is intentionally
+/// dropped (reasoning text comes back via `reasoning_content` instead).
+#[derive(Debug, Deserialize, Default)]
+pub struct ResponsesReasoning {
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +98,17 @@ pub struct ChatRequest {
     /// be sent explicitly for reasoning to be emitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ChatThinking>,
+    /// Reasoning budget, forwarded verbatim from the Responses request's
+    /// `reasoning.effort`. Deliberately a free-form String rather than an enum:
+    /// the accepted set is the upstream's business, not the relay's, and it
+    /// differs per provider (Command Code takes low|medium|high|xhigh|max and
+    /// rejects none/minimal; OpenRouter and OpenAI take other sets). Passing it
+    /// through unchanged means an unsupported value surfaces as the upstream's
+    /// own error instead of being silently rewritten here. Use
+    /// `--drop-upstream-params '["reasoning_effort"]'` to strip it for an
+    /// upstream that chokes on the field entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub stream: bool,
 }
 

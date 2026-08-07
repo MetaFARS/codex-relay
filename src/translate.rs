@@ -246,6 +246,14 @@ pub fn to_chat_request(
         thinking: enable_glm_thinking.then(|| ChatThinking {
             kind: "enabled".into(),
         }),
+        // Forwarded verbatim; see ChatRequest::reasoning_effort for why the
+        // relay does not validate or remap the value. Absent when Codex sends
+        // `"reasoning": null`, which it does for any model missing from its
+        // model catalog — in that case nothing is added to the upstream body.
+        reasoning_effort: req
+            .reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.effort.clone()),
         stream: req.stream,
     }
 }
@@ -753,7 +761,56 @@ mod tests {
             max_output_tokens: None,
             system: None,
             instructions: None,
+            reasoning: None,
         }
+    }
+
+    #[test]
+    fn test_reasoning_effort_is_forwarded_verbatim() {
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Text("hello".into()));
+        req.reasoning = Some(ResponsesReasoning {
+            effort: Some("xhigh".into()),
+        });
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.reasoning_effort.as_deref(), Some("xhigh"));
+        // Serialized shape matters: upstreams read a top-level string field.
+        let body = serde_json::to_value(&chat).unwrap();
+        assert_eq!(body["reasoning_effort"], json!("xhigh"));
+    }
+
+    #[test]
+    fn test_absent_reasoning_omits_the_field() {
+        // Codex sends `"reasoning": null` for any model missing from its model
+        // catalog. Nothing must be added to the upstream body in that case, or
+        // providers that reject unknown fields would start failing.
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Text("hello".into()));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert!(chat.reasoning_effort.is_none());
+        let body = serde_json::to_value(&chat).unwrap();
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_explicit_null_reasoning_deserializes_to_none() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "deepseek/deepseek-v4-flash",
+            "input": "hi",
+            "reasoning": null,
+        }))
+        .unwrap();
+        assert!(req.reasoning.is_none());
+    }
+
+    #[test]
+    fn test_reasoning_without_effort_forwards_nothing() {
+        // `{"reasoning": {"summary": "auto"}}` carries no budget to forward.
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Text("hello".into()));
+        req.reasoning = Some(ResponsesReasoning { effort: None });
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert!(chat.reasoning_effort.is_none());
     }
 
     #[test]

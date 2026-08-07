@@ -19,20 +19,76 @@
 //! the markup from the visible text. The `｜` (U+FF5C) delimiters are
 //! DeepSeek-internal tokens that never appear in legitimate output, so
 //! healing is always on.
+//!
+//! # Dialects
+//!
+//! V4 Flash leaks a *doubled* delimiter and expresses parameters as
+//! self-closing `invoke` tags whose value sits in the `string` attribute
+//! (observed 2026-08-07 via Command Code):
+//!
+//! ```text
+//! <｜｜DSML｜｜tool_calls>
+//! <｜｜DSML｜｜invoke name="exec_command">
+//! <｜｜DSML｜｜invoke name="cmd" string="echo alpha" />
+//! </｜｜DSML｜｜invoke>
+//! </｜｜DSML｜｜tool_calls>
+//! ```
+//!
+//! Matching only the single-bar form made healing a no-op for that model: the
+//! marker search missed, `parse_leaked_tool_calls` returned `None`, and the
+//! raw markup reached Codex as plain text. Both delimiters are handled now,
+//! and parameters are read by *shape* rather than by tag name — a self-closing
+//! tag has no body, so its value can only live in an attribute.
 
 use serde_json::{json, Value};
 
 use crate::types::ChatMessage;
 
-/// Prefix common to every DSML tag.
-pub const DSML_MARKER: &str = "<｜DSML｜";
+/// One delimiter flavour of the DSML markup.
+///
+/// Everything is spelled out per dialect rather than concatenated from a
+/// prefix, so a mistyped delimiter fails to compile instead of silently
+/// producing a marker that never matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DsmlDialect {
+    /// Prefix common to every opening tag of this dialect.
+    marker: &'static str,
+    invoke_open: &'static str,
+    invoke_close: &'static str,
+    calls_open: &'static str,
+    calls_close: &'static str,
+}
 
-const INVOKE_OPEN: &str = "<｜DSML｜invoke";
-const INVOKE_CLOSE: &str = "</｜DSML｜invoke>";
-const PARAM_OPEN: &str = "<｜DSML｜parameter";
-const PARAM_CLOSE: &str = "</｜DSML｜parameter>";
-const CALLS_OPEN: &str = "<｜DSML｜tool_calls>";
-const CALLS_CLOSE: &str = "</｜DSML｜tool_calls>";
+/// `<｜DSML｜…>` — V3.2 / V4 Pro.
+const SINGLE_BAR: DsmlDialect = DsmlDialect {
+    marker: "<｜DSML｜",
+    invoke_open: "<｜DSML｜invoke",
+    invoke_close: "</｜DSML｜invoke>",
+    calls_open: "<｜DSML｜tool_calls>",
+    calls_close: "</｜DSML｜tool_calls>",
+};
+
+/// `<｜｜DSML｜｜…>` — V4 Flash.
+const DOUBLE_BAR: DsmlDialect = DsmlDialect {
+    marker: "<｜｜DSML｜｜",
+    invoke_open: "<｜｜DSML｜｜invoke",
+    invoke_close: "</｜｜DSML｜｜invoke>",
+    calls_open: "<｜｜DSML｜｜tool_calls>",
+    calls_close: "</｜｜DSML｜｜tool_calls>",
+};
+
+/// Double-bar first: `<｜DSML｜` is not a substring of `<｜｜DSML｜｜` (the `<`
+/// is followed by two bars there), but probing the more specific form first
+/// keeps that independent of the delimiters ever changing.
+const DIALECTS: [DsmlDialect; 2] = [DOUBLE_BAR, SINGLE_BAR];
+
+/// The dialect whose marker appears earliest in `text`, if any.
+fn detect_dialect(text: &str) -> Option<(DsmlDialect, usize)> {
+    DIALECTS
+        .iter()
+        .filter_map(|dialect| text.find(dialect.marker).map(|at| (*dialect, at)))
+        .min_by_key(|(_, at)| *at)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DsmlToolCall {
@@ -47,54 +103,89 @@ pub struct DsmlToolCall {
 /// complete `<｜DSML｜invoke>` block could be parsed (the text is then left
 /// untouched so nothing is lost).
 pub fn parse_leaked_tool_calls(text: &str) -> Option<(String, Vec<DsmlToolCall>)> {
+    let (dialect, _) = detect_dialect(text)?;
     let mut calls = Vec::new();
     let mut cleaned = String::new();
     let mut rest = text;
 
-    while let Some(start) = rest.find(INVOKE_OPEN) {
-        let header_start = start + INVOKE_OPEN.len();
+    while let Some(start) = rest.find(dialect.invoke_open) {
+        let header_start = start + dialect.invoke_open.len();
         let Some(header_len) = unquoted_char(&rest[header_start..], '>') else {
             break;
         };
         let header = &rest[header_start..header_start + header_len];
         let body_start = header_start + header_len + 1;
-        let Some(body_len) = rest[body_start..].find(INVOKE_CLOSE) else {
+        let Some(body_len) = rest[body_start..].find(dialect.invoke_close) else {
             break;
         };
         let Some(name) = attribute(header, "name") else {
             break;
         };
-        let arguments = parse_parameters(&rest[body_start..body_start + body_len]);
+        let arguments = parse_parameters(&rest[body_start..body_start + body_len], dialect);
         calls.push(DsmlToolCall {
             name: name.to_string(),
             arguments: Value::Object(arguments).to_string(),
         });
         cleaned.push_str(&rest[..start]);
-        rest = &rest[body_start + body_len + INVOKE_CLOSE.len()..];
+        rest = &rest[body_start + body_len + dialect.invoke_close.len()..];
     }
 
     if calls.is_empty() {
         return None;
     }
     cleaned.push_str(rest);
-    let cleaned = cleaned.replace(CALLS_OPEN, "").replace(CALLS_CLOSE, "");
+    let cleaned = cleaned
+        .replace(dialect.calls_open, "")
+        .replace(dialect.calls_close, "");
     Some((cleaned.trim().to_string(), calls))
 }
 
-fn parse_parameters(body: &str) -> serde_json::Map<String, Value> {
+/// Parse the parameter tags inside one `invoke` body.
+///
+/// Tags are matched on the dialect marker rather than on a fixed tag name:
+/// single-bar leaks name them `parameter`, double-bar leaks reuse `invoke`.
+/// What actually distinguishes a value's location is the tag's *shape*:
+///
+/// - self-closing (`… />`) — no body exists, so the value is the `string`
+///   attribute (double-bar form).
+/// - with a body — the value is the body text, and `string="false"` marks it
+///   as a non-string JSON literal (single-bar form).
+fn parse_parameters(body: &str, dialect: DsmlDialect) -> serde_json::Map<String, Value> {
     let mut arguments = serde_json::Map::new();
     let mut rest = body;
-    while let Some(start) = rest.find(PARAM_OPEN) {
-        let header_start = start + PARAM_OPEN.len();
+    while let Some(start) = rest.find(dialect.marker) {
+        let header_start = start + dialect.marker.len();
         let Some(header_len) = unquoted_char(&rest[header_start..], '>') else {
             break;
         };
         let header = &rest[header_start..header_start + header_len];
-        let value_start = header_start + header_len + 1;
-        let Some(value_len) = rest[value_start..].find(PARAM_CLOSE) else {
+        let after_tag = header_start + header_len + 1;
+
+        let Some(tag) = header.split_whitespace().next() else {
             break;
         };
-        let raw = &rest[value_start..value_start + value_len];
+        // A closing tag (`</…invoke>`) means the enclosing element ended; the
+        // marker search cannot see `</` because the marker starts with `<`, so
+        // this only guards against a malformed header.
+        if tag.starts_with('/') {
+            rest = &rest[after_tag..];
+            continue;
+        }
+
+        if header.trim_end().ends_with('/') {
+            if let Some(name) = attribute(header, "name") {
+                let value = attribute(header, "string").unwrap_or_default();
+                arguments.insert(name.to_string(), Value::String(value.to_string()));
+            }
+            rest = &rest[after_tag..];
+            continue;
+        }
+
+        let close = format!("</{}{}>", dialect.marker.trim_start_matches('<'), tag);
+        let Some(value_len) = rest[after_tag..].find(&close) else {
+            break;
+        };
+        let raw = &rest[after_tag..after_tag + value_len];
         if let Some(name) = attribute(header, "name") {
             // string="false" marks a non-string JSON value (number, bool, ...).
             let value = if attribute(header, "string") == Some("false") {
@@ -105,7 +196,7 @@ fn parse_parameters(body: &str) -> serde_json::Map<String, Value> {
             };
             arguments.insert(name.to_string(), value);
         }
-        rest = &rest[value_start + value_len + PARAM_CLOSE.len()..];
+        rest = &rest[after_tag + value_len + close.len()..];
     }
     arguments
 }
@@ -150,7 +241,7 @@ pub(crate) fn synthesize_call_id() -> String {
 /// strip the markup from the visible text.
 pub fn heal_chat_message(message: &mut ChatMessage) {
     let text = message.text_content();
-    if !text.contains(DSML_MARKER) {
+    if detect_dialect(text).is_none() {
         return;
     }
     let Some((cleaned, calls)) = parse_leaked_tool_calls(text) else {
@@ -215,7 +306,7 @@ impl DsmlStreamFilter {
         if self.in_dsml {
             return String::new();
         }
-        if let Some(start) = self.pending.find(DSML_MARKER) {
+        if let Some((_, start)) = detect_dialect(&self.pending) {
             self.in_dsml = true;
             let emit = self.pending[..start].to_string();
             self.pending.drain(..start);
@@ -245,12 +336,19 @@ impl DsmlStreamFilter {
 }
 
 /// Length in bytes of the longest suffix of `text` that is a proper prefix of
-/// [`DSML_MARKER`].
+/// any dialect's marker.
+///
+/// Taking the maximum across dialects matters: `<｜` is a prefix of both, and
+/// withholding only the shorter one would emit the first bar of a double-bar
+/// marker before the rest of it arrives, splitting the marker across chunks so
+/// it never matches.
 fn longest_marker_prefix_suffix(text: &str) -> usize {
     let mut best = 0;
-    for (i, _) in DSML_MARKER.char_indices().skip(1) {
-        if text.ends_with(&DSML_MARKER[..i]) {
-            best = i;
+    for dialect in DIALECTS {
+        for (i, _) in dialect.marker.char_indices().skip(1) {
+            if text.ends_with(&dialect.marker[..i]) {
+                best = best.max(i);
+            }
         }
     }
     best
@@ -298,6 +396,80 @@ mod tests {
     fn plain_text_is_untouched() {
         assert!(parse_leaked_tool_calls("no markup here, just a < b").is_none());
         assert!(parse_leaked_tool_calls("<｜DSML｜tool_calls>dangling").is_none());
+        assert!(parse_leaked_tool_calls("<｜｜DSML｜｜tool_calls>dangling").is_none());
+    }
+
+    /// Verbatim capture from Codex 0.144.5 → relay → Command Code →
+    /// deepseek/deepseek-v4-flash, 2026-08-07. Doubled delimiters, and the
+    /// parameter is a self-closing `invoke` carrying its value in `string`.
+    const DOUBLE_BAR_ENVELOPE: &str = "<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"exec_command\">\n<｜｜DSML｜｜invoke name=\"cmd\" string=\"echo alpha\" />\n</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>";
+
+    #[test]
+    fn parses_double_bar_envelope_with_self_closing_parameters() {
+        let text = format!("Let me run it.\n{DOUBLE_BAR_ENVELOPE}");
+        let (cleaned, calls) = parse_leaked_tool_calls(&text).expect("healed");
+        assert_eq!(cleaned, "Let me run it.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "exec_command");
+        let args: Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["cmd"], "echo alpha");
+    }
+
+    #[test]
+    fn double_bar_self_closing_parameter_keeps_special_characters() {
+        // Quotes inside the value would end the header scan early if the `>`
+        // search were not quote-aware; `/` inside it must not read as
+        // self-closing on its own either.
+        let text = "<｜｜DSML｜｜invoke name=\"exec_command\">\n<｜｜DSML｜｜invoke name=\"cmd\" string=\"grep -r a/b > out.txt\" />\n</｜｜DSML｜｜invoke>";
+        let (_, calls) = parse_leaked_tool_calls(text).expect("healed");
+        let args: Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["cmd"], "grep -r a/b > out.txt");
+    }
+
+    #[test]
+    fn double_bar_supports_bodied_parameters_too() {
+        // Not observed in the wild, but the dialect differs only in the
+        // delimiter; a bodied parameter must not silently drop its value.
+        let text = "<｜｜DSML｜｜invoke name=\"bash\">\n<｜｜DSML｜｜parameter name=\"command\" string=\"true\">ls -la</｜｜DSML｜｜parameter>\n<｜｜DSML｜｜parameter name=\"timeout\" string=\"false\">15</｜｜DSML｜｜parameter>\n</｜｜DSML｜｜invoke>";
+        let (_, calls) = parse_leaked_tool_calls(text).expect("healed");
+        let args: Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["command"], "ls -la");
+        assert_eq!(args["timeout"], 15);
+    }
+
+    #[test]
+    fn heal_chat_message_fires_on_double_bar() {
+        let mut message = ChatMessage {
+            role: "assistant".into(),
+            content: Some(Value::String(DOUBLE_BAR_ENVELOPE.to_string())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        heal_chat_message(&mut message);
+        let calls = message.tool_calls.expect("tool calls synthesized");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "exec_command");
+        assert!(message.content.is_none());
+    }
+
+    #[test]
+    fn stream_filter_holds_split_double_bar_marker_and_heals() {
+        let mut filter = DsmlStreamFilter::default();
+        let mut emitted = String::new();
+        // Split inside the doubled delimiter: withholding only a single-bar
+        // prefix here would leak "<｜" and desync the marker.
+        emitted.push_str(&filter.push("Let me run it.<｜"));
+        emitted.push_str(&filter.push("｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"exec_command\">\n<｜｜DSML｜｜invoke name=\"cmd\" string=\"echo alpha\" />\n</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜"));
+        emitted.push_str(&filter.push("tool_calls>"));
+        assert_eq!(emitted, "Let me run it.");
+        let (leftover, calls) = filter.finish();
+        assert_eq!(leftover, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "exec_command");
+        let args: Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["cmd"], "echo alpha");
     }
 
     #[test]

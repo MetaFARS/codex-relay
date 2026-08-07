@@ -224,6 +224,8 @@ pub fn to_chat_request(
         }
     }
 
+    drop_contentless_messages(&mut messages);
+
     let mapped_model = map_model_name(&req.model);
     // GLM/Zhipu only emits reasoning_content when `thinking` is explicitly
     // enabled; its default auto-thinking is suppressed by heavy agent system
@@ -665,6 +667,71 @@ pub(crate) fn split_mcp_function_name(name: &str) -> (Option<String>, String) {
     )
 }
 
+/// True when a user/system message would reach the upstream carrying nothing.
+///
+/// `None`, `""`, whitespace, an empty parts array, or a parts array whose text
+/// parts are all blank and which has no image (or other non-text) part.
+fn is_contentless(msg: &ChatMessage) -> bool {
+    match &msg.content {
+        None => true,
+        Some(Value::String(s)) => s.trim().is_empty(),
+        Some(Value::Array(parts)) => parts.iter().all(|part| {
+            let kind = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match kind {
+                "text" | "input_text" | "output_text" => part
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|t| t.trim().is_empty())
+                    .unwrap_or(true),
+                // Images and unknown part types carry payload; keep them.
+                _ => false,
+            }
+        }),
+        Some(Value::Null) => true,
+        Some(_) => false,
+    }
+}
+
+/// Drop user/system messages that carry no content at all.
+///
+/// Several Chat Completions upstreams reject the WHOLE request when any
+/// message has empty content — Command Code answers
+/// `400 user message must have content, param=messages.N.content`. Because
+/// Codex replays its full thread history on every turn, one blank message
+/// persisted into that history bricks the thread permanently: every later
+/// turn 400s, the client retries and then closes the turn with no output and
+/// no error anyone can see (observed 2026-08-07, an image-only chat message
+/// that reached Codex as `{"type":"text","text":""}`).
+///
+/// Only user/system messages are eligible. An assistant message with empty
+/// content may still carry `tool_calls`, and a `tool` message is pinned to its
+/// call by `tool_call_id` — dropping either breaks the pairing the Chat
+/// Completions API requires. The last remaining message is never dropped
+/// either: an empty `messages` array is its own 400.
+fn drop_contentless_messages(messages: &mut Vec<ChatMessage>) {
+    let mut keep: Vec<bool> = Vec::with_capacity(messages.len());
+    let mut kept = 0usize;
+    for msg in messages.iter() {
+        let droppable = matches!(msg.role.as_str(), "user" | "system")
+            && msg.tool_calls.is_none()
+            && msg.tool_call_id.is_none()
+            && is_contentless(msg);
+        keep.push(!droppable);
+        if !droppable {
+            kept += 1;
+        }
+    }
+    if kept == 0 {
+        return;
+    }
+    let mut index = 0;
+    messages.retain(|_| {
+        let decision = keep[index];
+        index += 1;
+        decision
+    });
+}
+
 /// Translate a Responses-API `content` value to its Chat Completions equivalent.
 ///
 /// - Plain string → `Value::String`.
@@ -764,6 +831,92 @@ mod tests {
         assert_eq!(chat.messages.len(), 1);
         assert_eq!(chat.messages[0].role, "user");
         assert_eq!(chat.messages[0].text_content(), "hello");
+    }
+
+    #[test]
+    fn test_blank_user_message_in_history_is_dropped() {
+        // A single blank message persisted in a Codex thread bricked it:
+        // the upstream answered `400 user message must have content` for
+        // EVERY later turn, since Codex replays the whole history.
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "message", "role": "user", "content": "first"}),
+            json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": ""}]}),
+            json!({"type": "message", "role": "user", "content": "second"}),
+        ]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        let texts: Vec<&str> = chat.messages.iter().map(|m| m.text_content()).collect();
+        assert_eq!(texts, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn test_whitespace_only_user_message_is_dropped() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "message", "role": "user", "content": "   \n "}),
+            json!({"type": "message", "role": "user", "content": "real"}),
+        ]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].text_content(), "real");
+    }
+
+    #[test]
+    fn test_image_only_message_is_kept() {
+        // No text, but there IS a payload — dropping it would lose the image.
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": ""},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAA"}
+            ]
+        })]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages.len(), 1);
+        assert!(chat.messages[0].content.as_ref().unwrap().is_array());
+    }
+
+    #[test]
+    fn test_assistant_message_with_tool_calls_and_no_content_is_kept() {
+        // Empty content is legal — and required — for a tool-calling turn.
+        let mut messages = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![json!({"id": "c1"})]),
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some(Value::String(String::new())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: Some("c1".into()),
+                name: None,
+            },
+        ];
+        drop_contentless_messages(&mut messages);
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn test_never_empties_the_message_array() {
+        // An all-blank request must still be a well-formed one; let the
+        // upstream decide, rather than sending zero messages.
+        let mut messages = vec![ChatMessage {
+            role: "user".into(),
+            content: Some(Value::String(String::new())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        drop_contentless_messages(&mut messages);
+        assert_eq!(messages.len(), 1);
     }
 
     #[test]

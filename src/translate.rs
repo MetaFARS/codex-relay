@@ -27,8 +27,17 @@ pub fn to_chat_request(
 ) -> ChatRequest {
     let mut messages = history;
 
+    // History can contain poison blank messages from an earlier turn. Remove
+    // them before deciding whether an existing system prompt suppresses the
+    // current request's instructions.
+    messages.retain(|msg| !is_droppable_contentless(msg));
+
     // Prefer `instructions` (Codex CLI) over `system` (other clients).
-    let system_text = req.instructions.as_ref().or(req.system.as_ref());
+    let system_text = req
+        .instructions
+        .as_ref()
+        .filter(|text| !text.trim().is_empty())
+        .or_else(|| req.system.as_ref().filter(|text| !text.trim().is_empty()));
     if let Some(system) = system_text {
         if messages.is_empty() || messages[0].role != "system" {
             messages.insert(
@@ -93,6 +102,16 @@ pub fn to_chat_request(
                 let item = &items[i];
                 let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
+                if is_contentless_response_message(item)
+                    && matches!(
+                        item.get("role").and_then(Value::as_str),
+                        Some("system" | "developer")
+                    )
+                {
+                    i += 1;
+                    continue;
+                }
+
                 if matches!(item_type, "function_call" | "custom_tool_call") {
                     // Skip function_call items whose call_id already exists in history.
                     // Duplicates occur when both previous_response_id and input replay
@@ -110,6 +129,10 @@ pub fn to_chat_request(
                     while i < items.len() {
                         let cur = &items[i];
                         let cur_type = cur.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if is_contentless_response_message(cur) {
+                            i += 1;
+                            continue;
+                        }
                         if !matches!(cur_type, "function_call" | "custom_tool_call") {
                             break;
                         }
@@ -224,6 +247,8 @@ pub fn to_chat_request(
         }
     }
 
+    drop_contentless_messages(&mut messages);
+
     let mapped_model = map_model_name(&req.model);
     // GLM/Zhipu only emits reasoning_content when `thinking` is explicitly
     // enabled; its default auto-thinking is suppressed by heavy agent system
@@ -246,6 +271,14 @@ pub fn to_chat_request(
         thinking: enable_glm_thinking.then(|| ChatThinking {
             kind: "enabled".into(),
         }),
+        // Forwarded verbatim; see ChatRequest::reasoning_effort for why the
+        // relay does not validate or remap the value. Absent when Codex sends
+        // `"reasoning": null`, which it does for any model missing from its
+        // model catalog — in that case nothing is added to the upstream body.
+        reasoning_effort: req
+            .reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.effort.clone()),
         stream: req.stream,
     }
 }
@@ -561,9 +594,30 @@ pub fn from_chat_response_with_tool_maps(
         crate::dsml::heal_chat_message(&mut choice.message);
     }
 
+    // Reasoning models served without a vLLM reasoning parser leak `<think>`
+    // markup into the text content instead of `reasoning_content`; split it out
+    // so Codex never renders it and history never replays it.
+    // Quirk `think_tags`, see quirks.rs.
+    if crate::quirks::quirk_enabled("think_tags") {
+        crate::think::heal_chat_message(&mut choice.message);
+    }
+
     let usage = chat.usage.unwrap_or_default();
     tracing::debug!("cache(non-stream): {}", usage.cache_summary());
     let mut output = Vec::new();
+
+    if let Some(reasoning) = choice
+        .message
+        .reasoning_content
+        .as_deref()
+        .filter(|reasoning| !reasoning.is_empty())
+    {
+        output.push(json!({
+            "type": "reasoning",
+            "id": format!("rs_{}", uuid::Uuid::new_v4().simple()),
+            "summary": [{"type": "summary_text", "text": reasoning}]
+        }));
+    }
 
     let text = choice.message.text_content().to_string();
     if !text.is_empty() || choice.message.tool_calls.is_none() {
@@ -606,6 +660,9 @@ pub fn from_chat_response_with_tool_maps(
                     "status": "completed"
                 });
                 if let Some(namespace) = namespace {
+                    if uses_plaintext_collaboration_args(Some(&namespace), &name) {
+                        item["encrypted_function_args"] = json!([]);
+                    }
                     item["namespace"] = Value::String(namespace);
                 }
                 item
@@ -642,6 +699,11 @@ pub(crate) fn response_function_name_for_responses(
     split_mcp_function_name(name)
 }
 
+pub(crate) fn uses_plaintext_collaboration_args(namespace: Option<&str>, name: &str) -> bool {
+    namespace == Some("collaboration")
+        && matches!(name, "spawn_agent" | "send_message" | "followup_task")
+}
+
 pub(crate) fn split_mcp_function_name(name: &str) -> (Option<String>, String) {
     if let Some((namespace, child)) = name.split_once('.') {
         if !namespace.is_empty() && !child.is_empty() {
@@ -665,6 +727,83 @@ pub(crate) fn split_mcp_function_name(name: &str) -> (Option<String>, String) {
     )
 }
 
+/// True when a user/system message would reach the upstream carrying nothing.
+///
+/// `None`, `""`, whitespace, an empty parts array, or a parts array whose text
+/// parts are all blank and which has no image (or other non-text) part.
+fn is_contentless(msg: &ChatMessage) -> bool {
+    is_content_value_contentless(msg.content.as_ref())
+}
+
+fn is_content_value_contentless(content: Option<&Value>) -> bool {
+    match content {
+        None => true,
+        Some(Value::String(text)) => text.trim().is_empty(),
+        Some(Value::Array(parts)) => parts.iter().all(|part| {
+            let kind = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match kind {
+                "text" | "input_text" | "output_text" => part
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|t| t.trim().is_empty())
+                    .unwrap_or(true),
+                // Images and unknown part types carry payload; keep them.
+                _ => false,
+            }
+        }),
+        Some(Value::Null) => true,
+        Some(_) => false,
+    }
+}
+
+fn is_droppable_contentless(msg: &ChatMessage) -> bool {
+    matches!(msg.role.as_str(), "user" | "system")
+        && msg.tool_calls.is_none()
+        && msg.tool_call_id.is_none()
+        && is_contentless(msg)
+}
+
+fn is_contentless_response_message(item: &Value) -> bool {
+    if !matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("message" | "agent_message")
+    ) {
+        return false;
+    }
+    let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+    matches!(role, "user" | "system" | "developer")
+        && is_content_value_contentless(item.get("content"))
+}
+
+/// Drop user/system messages that carry no content at all.
+///
+/// Several Chat Completions upstreams reject the WHOLE request when any
+/// message has empty content — Command Code answers
+/// `400 user message must have content, param=messages.N.content`. Because
+/// Codex replays its full thread history on every turn, one blank message
+/// persisted into that history bricks the thread permanently: every later
+/// turn 400s, the client retries and then closes the turn with no output and
+/// no error anyone can see (observed 2026-08-07, an image-only chat message
+/// that reached Codex as `{"type":"text","text":""}`).
+///
+/// Only user/system messages are eligible. An assistant message with empty
+/// content may still carry `tool_calls`, and a `tool` message is pinned to its
+/// call by `tool_call_id` — dropping either breaks the pairing the Chat
+/// Completions API requires. The last remaining message is never dropped
+/// either: an empty `messages` array is its own 400.
+fn drop_contentless_messages(messages: &mut Vec<ChatMessage>) {
+    if messages.is_empty() {
+        return;
+    }
+    if messages.iter().all(is_droppable_contentless) {
+        let newest = messages.pop().expect("messages is non-empty");
+        messages.clear();
+        messages.push(newest);
+    } else {
+        messages.retain(|msg| !is_droppable_contentless(msg));
+    }
+}
+
 /// Translate a Responses-API `content` value to its Chat Completions equivalent.
 ///
 /// - Plain string → `Value::String`.
@@ -682,6 +821,7 @@ pub(crate) fn split_mcp_function_name(name: &str) -> (Option<String>, String) {
 fn value_to_chat_content(v: Option<&Value>) -> Option<Value> {
     match v {
         None => None,
+        Some(Value::Null) => None,
         Some(Value::String(s)) => Some(Value::String(s.clone())),
         Some(Value::Array(parts)) => {
             // `output_text` is what Codex replays for assistant history items;
@@ -753,7 +893,56 @@ mod tests {
             max_output_tokens: None,
             system: None,
             instructions: None,
+            reasoning: None,
         }
+    }
+
+    #[test]
+    fn test_reasoning_effort_is_forwarded_verbatim() {
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Text("hello".into()));
+        req.reasoning = Some(ResponsesReasoning {
+            effort: Some("xhigh".into()),
+        });
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.reasoning_effort.as_deref(), Some("xhigh"));
+        // Serialized shape matters: upstreams read a top-level string field.
+        let body = serde_json::to_value(&chat).unwrap();
+        assert_eq!(body["reasoning_effort"], json!("xhigh"));
+    }
+
+    #[test]
+    fn test_absent_reasoning_omits_the_field() {
+        // Codex sends `"reasoning": null` for any model missing from its model
+        // catalog. Nothing must be added to the upstream body in that case, or
+        // providers that reject unknown fields would start failing.
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Text("hello".into()));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert!(chat.reasoning_effort.is_none());
+        let body = serde_json::to_value(&chat).unwrap();
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_explicit_null_reasoning_deserializes_to_none() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "deepseek/deepseek-v4-flash",
+            "input": "hi",
+            "reasoning": null,
+        }))
+        .unwrap();
+        assert!(req.reasoning.is_none());
+    }
+
+    #[test]
+    fn test_reasoning_without_effort_forwards_nothing() {
+        // `{"reasoning": {"summary": "auto"}}` carries no budget to forward.
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Text("hello".into()));
+        req.reasoning = Some(ResponsesReasoning { effort: None });
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert!(chat.reasoning_effort.is_none());
     }
 
     #[test]
@@ -767,6 +956,126 @@ mod tests {
     }
 
     #[test]
+    fn test_blank_user_message_in_history_is_dropped() {
+        // A single blank message persisted in a Codex thread bricked it:
+        // the upstream answered `400 user message must have content` for
+        // EVERY later turn, since Codex replays the whole history.
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "message", "role": "user", "content": "first"}),
+            json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": ""}]}),
+            json!({"type": "message", "role": "user", "content": "second"}),
+        ]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        let texts: Vec<&str> = chat.messages.iter().map(|m| m.text_content()).collect();
+        assert_eq!(texts, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn test_whitespace_only_user_message_is_dropped() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "message", "role": "user", "content": "   \n "}),
+            json!({"type": "message", "role": "user", "content": "real"}),
+        ]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].text_content(), "real");
+    }
+
+    #[test]
+    fn test_null_user_message_is_dropped() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "message", "role": "user", "content": null}),
+            json!({"type": "message", "role": "user", "content": "real"}),
+        ]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].text_content(), "real");
+    }
+
+    #[test]
+    fn test_image_only_message_is_kept() {
+        // No text, but there IS a payload — dropping it would lose the image.
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": ""},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAA"}
+            ]
+        })]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages.len(), 1);
+        assert!(chat.messages[0].content.as_ref().unwrap().is_array());
+    }
+
+    #[test]
+    fn test_assistant_message_with_tool_calls_and_no_content_is_kept() {
+        // Empty content is legal — and required — for a tool-calling turn.
+        let mut messages = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![json!({"id": "c1"})]),
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some(Value::String(String::new())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: Some("c1".into()),
+                name: None,
+            },
+        ];
+        drop_contentless_messages(&mut messages);
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn test_never_empties_the_message_array() {
+        // An all-blank request must still be a well-formed one; let the
+        // upstream decide, rather than sending zero messages.
+        let mut messages = vec![ChatMessage {
+            role: "user".into(),
+            content: Some(Value::String(String::new())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        drop_contentless_messages(&mut messages);
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn test_all_blank_messages_keep_only_the_newest() {
+        let mut messages = ["first", "second", "newest"]
+            .into_iter()
+            .map(|name| ChatMessage {
+                role: "user".into(),
+                content: Some(Value::String(if name == "newest" {
+                    "\n".into()
+                } else {
+                    String::new()
+                })),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: Some(name.into()),
+            })
+            .collect();
+        drop_contentless_messages(&mut messages);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].name.as_deref(), Some("newest"));
+    }
+
+    #[test]
     fn test_system_prompt_from_instructions() {
         let sessions = SessionStore::new();
         let mut req = base_req(ResponsesInput::Text("hi".into()));
@@ -774,6 +1083,46 @@ mod tests {
         let chat = to_chat_request(&req, vec![], &sessions);
         assert_eq!(chat.messages[0].role, "system");
         assert_eq!(chat.messages[0].text_content(), "be helpful");
+    }
+
+    #[test]
+    fn test_blank_developer_input_does_not_replace_instructions() {
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "message", "role": "developer", "content": "  "}),
+            json!({"type": "message", "role": "user", "content": "hi"}),
+        ]));
+        req.instructions = Some("be helpful".into());
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages[0].role, "system");
+        assert_eq!(chat.messages[0].text_content(), "be helpful");
+    }
+
+    #[test]
+    fn test_blank_history_system_does_not_suppress_instructions() {
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Text("hi".into()));
+        req.instructions = Some("current instructions".into());
+        let history = vec![ChatMessage {
+            role: "system".into(),
+            content: Some(String::new().into()),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let chat = to_chat_request(&req, history, &sessions);
+        assert_eq!(chat.messages[0].text_content(), "current instructions");
+    }
+
+    #[test]
+    fn test_blank_instructions_fall_back_to_system() {
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Text("hi".into()));
+        req.instructions = Some(" \n".into());
+        req.system = Some("system fallback".into());
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages[0].text_content(), "system fallback");
     }
 
     #[test]
@@ -801,6 +1150,27 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0]["id"], "c1");
         assert_eq!(calls[1]["id"], "c2");
+    }
+
+    #[test]
+    fn test_blank_messages_do_not_split_parallel_tool_calls() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "function_call", "call_id": "c1", "name": "fn_a", "arguments": "{}"}),
+            json!({"type": "message", "role": "user", "content": ""}),
+            json!({"type": "message", "role": "system", "content": []}),
+            json!({"type": "function_call", "call_id": "c2", "name": "fn_b", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "c1", "output": "one"}),
+            json!({"type": "function_call_output", "call_id": "c2", "output": "two"}),
+        ]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages.len(), 3);
+        let calls = chat.messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["id"], "c1");
+        assert_eq!(calls[1]["id"], "c2");
+        assert_eq!(chat.messages[1].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(chat.messages[2].tool_call_id.as_deref(), Some("c2"));
     }
 
     #[test]
@@ -888,6 +1258,62 @@ mod tests {
         assert_eq!(resp.output[0]["namespace"], "mcp__node_repl");
         assert_eq!(resp.output[0]["name"], "status");
         assert_eq!(resp.output[0]["call_id"], "call_status");
+    }
+
+    #[test]
+    fn test_collaboration_calls_request_plaintext_arguments() {
+        let call_names = [
+            "collaboration-spawn_agent",
+            "collaboration-send_message",
+            "collaboration-followup_task",
+            "collaboration-wait",
+            "unrelated",
+        ];
+        let chat = ChatResponse {
+            choices: vec![ChatChoice {
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(
+                        call_names
+                            .iter()
+                            .enumerate()
+                            .map(|(index, name)| {
+                                json!({
+                                    "id": format!("call_{index}"),
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": "{}"}
+                                })
+                            })
+                            .collect(),
+                    ),
+                    tool_call_id: None,
+                    name: None,
+                },
+            }],
+            usage: None,
+        };
+        let tools = vec![json!({
+            "type": "namespace",
+            "name": "collaboration",
+            "tools": [
+                {"type": "function", "name": "spawn_agent"},
+                {"type": "function", "name": "send_message"},
+                {"type": "function", "name": "followup_task"},
+                {"type": "function", "name": "wait"}
+            ]
+        })];
+        let namespace_tools = namespace_tool_map(&tools);
+
+        let (resp, _) =
+            from_chat_response_with_tool_map("resp_1".into(), "test-model", chat, &namespace_tools);
+        for item in &resp.output[..3] {
+            assert_eq!(item["namespace"], "collaboration");
+            assert_eq!(item["encrypted_function_args"], json!([]));
+        }
+        assert!(resp.output[3].get("encrypted_function_args").is_none());
+        assert!(resp.output[4].get("encrypted_function_args").is_none());
     }
 
     #[test]
@@ -1151,6 +1577,21 @@ mod tests {
         let chat = to_chat_request(&req, vec![], &sessions);
         assert!(chat.messages[0].content.as_ref().unwrap().is_string());
         assert_eq!(chat.messages[0].text_content(), "hi");
+    }
+
+    #[test]
+    fn test_agent_message_plaintext_input_reaches_chat_upstream() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![json!({
+        "type": "agent_message",
+        "author": "agent-a",
+        "recipient": "agent-b",
+        "content": [
+            {"type": "input_text", "text": "do the task"}
+        ]})]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert!(chat.messages[0].content.as_ref().unwrap().is_string());
+        assert_eq!(chat.messages[0].text_content(), "do the task");
     }
 
     #[test]

@@ -1430,6 +1430,68 @@ async fn issue_17_streaming_namespaced_tool_calls_emit_namespace_field() {
 }
 
 #[tokio::test]
+async fn issue_43_streaming_collaboration_calls_request_plaintext_arguments() {
+    let tool_sse = sse_from_chunks(vec![
+        json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_spawn",
+                        "function": {
+                            "name": "collaboration-spawn_agent",
+                            "arguments": "{\"message\":\"do the task\"}"
+                        }
+                    }]
+                }
+            }]
+        }),
+        json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}),
+    ]);
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![tool_sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({
+            "model": "mock-model",
+            "input": "Delegate the task.",
+            "tools": [{
+                "type": "namespace",
+                "name": "collaboration",
+                "tools": [{
+                    "type": "function",
+                    "name": "spawn_agent",
+                    "parameters": {"type": "object"}
+                }]
+            }],
+            "stream": true
+        }),
+    )
+    .await;
+
+    for event_name in ["response.output_item.added", "response.output_item.done"] {
+        let item = events
+            .iter()
+            .find(|(event, data)| event == event_name && data["item"]["type"] == "function_call")
+            .map(|(_, data)| &data["item"])
+            .unwrap_or_else(|| panic!("{event_name} function_call item"));
+        assert_eq!(item["namespace"], "collaboration");
+        assert_eq!(item["name"], "spawn_agent");
+        assert_eq!(item["encrypted_function_args"], json!([]));
+    }
+
+    let completed = events
+        .iter()
+        .find_map(|(event, data)| (event == "response.completed").then_some(data))
+        .expect("response.completed");
+    assert_eq!(
+        completed["response"]["output"][0]["encrypted_function_args"],
+        json!([])
+    );
+}
+
+#[tokio::test]
 async fn issue_20_streaming_hyphen_flat_tool_name_is_not_namespaced() {
     let tool_sse = sse_from_chunks(vec![
         json!({

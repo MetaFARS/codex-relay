@@ -17,7 +17,8 @@ use crate::{
     session::SessionStore,
     think::ThinkStreamFilter,
     translate::{
-        custom_tool_input, response_function_name_for_responses, CustomToolMap, NamespaceToolMap,
+        custom_tool_input, response_function_name_for_responses, uses_plaintext_collaboration_args,
+        CustomToolMap, NamespaceToolMap,
     },
     types::{ChatMessage, ChatRequest, ChatStreamChunk, ChatUsage},
     upstream_request::UpstreamRequestConfig,
@@ -502,6 +503,10 @@ pub fn translate_stream(
                     "status": "completed"
                 });
                 if let Some(namespace) = namespace {
+                    if uses_plaintext_collaboration_args(Some(&namespace), &name) {
+                        added["encrypted_function_args"] = json!([]);
+                        done["encrypted_function_args"] = json!([]);
+                    }
                     added["namespace"] = Value::String(namespace.clone());
                     done["namespace"] = Value::String(namespace);
                 }

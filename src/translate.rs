@@ -52,7 +52,13 @@ pub fn to_chat_request(
 
     // History can contain poison blank messages from an earlier turn. Remove
     // them before deciding whether an existing system prompt suppresses the
-    // current request's instructions.
+    // current request's instructions. Keep the newest one as a fallback in
+    // case the complete history and input contain nothing else.
+    let mut latest_contentless_fallback = messages
+        .iter()
+        .rev()
+        .find(|msg| is_droppable_contentless(msg))
+        .cloned();
     messages.retain(|msg| !is_droppable_contentless(msg));
 
     // Prefer `instructions` (Codex CLI) over `system` (other clients).
@@ -80,14 +86,18 @@ pub fn to_chat_request(
     // Append new input, mapping Responses API roles to Chat Completions roles.
     match &req.input {
         ResponsesInput::Text(text) => {
-            messages.push(ChatMessage {
+            let msg = ChatMessage {
                 role: "user".into(),
                 content: Some(Value::String(text.clone())),
                 reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
-            });
+            };
+            if is_droppable_contentless(&msg) {
+                latest_contentless_fallback = Some(msg.clone());
+            }
+            messages.push(msg);
         }
         ResponsesInput::Messages(items) => {
             // Request-scoped custom tool map so replayed custom_tool_call items
@@ -109,6 +119,7 @@ pub fn to_chat_request(
                     ids
                 })
                 .collect();
+            let mut seen_call_ids = existing_call_ids.clone();
 
             // For function_call_output dedup, only skip if a tool response
             // already exists for the call_id (not just from assistant tool_calls).
@@ -116,6 +127,7 @@ pub fn to_chat_request(
                 .iter()
                 .filter_map(|msg| msg.tool_call_id.clone())
                 .collect();
+            let mut seen_tool_responses = existing_tool_responses;
 
             // Process items with index so we can group consecutive function_call
             // entries into a single assistant message. Providers require all tool
@@ -125,25 +137,13 @@ pub fn to_chat_request(
                 let item = &items[i];
                 let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-                if is_contentless_response_message(item)
-                    && matches!(
-                        item.get("role").and_then(Value::as_str),
-                        Some("system" | "developer")
-                    )
-                {
+                if is_contentless_response_message(item) {
+                    latest_contentless_fallback = Some(response_message_to_chat(item));
                     i += 1;
                     continue;
                 }
 
                 if matches!(item_type, "function_call" | "custom_tool_call") {
-                    // Skip function_call items whose call_id already exists in history.
-                    // Duplicates occur when both previous_response_id and input replay
-                    // the same function_call entries from prior output.
-                    let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-                    if existing_call_ids.contains(call_id) {
-                        i += 1;
-                        continue;
-                    }
                     // Collect this and all immediately following tool call items
                     // into one assistant message with multiple tool_calls entries.
                     let mut grouped: Vec<Value> = Vec::new();
@@ -153,6 +153,7 @@ pub fn to_chat_request(
                         let cur = &items[i];
                         let cur_type = cur.get("type").and_then(|v| v.as_str()).unwrap_or("");
                         if is_contentless_response_message(cur) {
+                            latest_contentless_fallback = Some(response_message_to_chat(cur));
                             i += 1;
                             continue;
                         }
@@ -160,6 +161,10 @@ pub fn to_chat_request(
                             break;
                         }
                         let call_id = cur.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                        if !seen_call_ids.insert(call_id.to_string()) {
+                            i += 1;
+                            continue;
+                        }
                         let name = response_function_name_for_chat(cur);
                         let args = if cur_type == "custom_tool_call" {
                             let input = cur.get("input").and_then(Value::as_str).unwrap_or("");
@@ -185,6 +190,10 @@ pub fn to_chat_request(
                         i += 1;
                     }
 
+                    if grouped.is_empty() {
+                        continue;
+                    }
+
                     let mut msg = ChatMessage {
                         role: "assistant".into(),
                         content: None,
@@ -204,15 +213,19 @@ pub fn to_chat_request(
                             let call_id =
                                 item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                             // Skip function_call_output items if a tool response
-                            // for this call_id already exists in history.
-                            if existing_tool_responses.contains(call_id) {
+                            // for this call_id already exists in history or input.
+                            if !seen_tool_responses.insert(call_id.to_string()) {
                                 i += 1;
                                 continue;
                             }
-                            let output = item.get("output").and_then(|v| v.as_str()).unwrap_or("");
+                            let output = match item.get("output") {
+                                Some(Value::String(output)) => output.clone(),
+                                Some(output) => output.to_string(),
+                                None => String::new(),
+                            };
                             messages.push(ChatMessage {
                                 role: "tool".into(),
-                                content: Some(Value::String(output.to_string())),
+                                content: Some(Value::String(output)),
                                 reasoning_content: None,
                                 tool_calls: None,
                                 tool_call_id: Some(call_id.to_string()),
@@ -227,20 +240,7 @@ pub fn to_chat_request(
                         "reasoning" => {}
                         _ => {
                             // Regular user/assistant/developer message
-                            let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-                            let role = match role {
-                                "developer" => "system",
-                                other => other,
-                            }
-                            .to_string();
-                            let mut msg = ChatMessage {
-                                role,
-                                content: value_to_chat_content(item.get("content")),
-                                reasoning_content: None,
-                                tool_calls: None,
-                                tool_call_id: None,
-                                name: None,
-                            };
+                            let mut msg = response_message_to_chat(item);
                             // For assistant messages, try to recover reasoning_content
                             // from the turn-level index (needed for thinking models like
                             // DeepSeek that require reasoning_content to be passed back).
@@ -271,6 +271,16 @@ pub fn to_chat_request(
     }
 
     drop_contentless_messages(&mut messages);
+    if messages.is_empty() {
+        messages.push(latest_contentless_fallback.unwrap_or_else(|| ChatMessage {
+            role: "user".into(),
+            content: Some(Value::String(String::new())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }));
+    }
 
     let mapped_model = map_model_name(&req.model);
     // GLM/Zhipu only emits reasoning_content when `thinking` is explicitly
@@ -814,6 +824,18 @@ fn is_contentless_response_message(item: &Value) -> bool {
         && is_content_value_contentless(item.get("content"))
 }
 
+fn response_message_to_chat(item: &Value) -> ChatMessage {
+    let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+    ChatMessage {
+        role: if role == "developer" { "system" } else { role }.to_string(),
+        content: value_to_chat_content(item.get("content")),
+        reasoning_content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    }
+}
+
 /// Drop user/system messages that carry no content at all.
 ///
 /// Several Chat Completions upstreams reject the WHOLE request when any
@@ -1138,6 +1160,51 @@ mod tests {
     }
 
     #[test]
+    fn test_only_blank_developer_input_is_kept_as_fallback() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![json!({
+            "type": "message",
+            "role": "developer",
+            "content": " \n "
+        })]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, "system");
+        assert_eq!(chat.messages[0].content, Some(json!(" \n ")));
+    }
+
+    #[test]
+    fn test_newer_blank_input_wins_over_blank_history_fallback() {
+        let sessions = SessionStore::new();
+        let history = vec![ChatMessage {
+            role: "user".into(),
+            content: Some(json!(" \t")),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let req = base_req(ResponsesInput::Messages(vec![json!({
+            "type": "message",
+            "role": "developer",
+            "content": " \n "
+        })]));
+        let chat = to_chat_request(&req, history, &sessions);
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, "system");
+        assert_eq!(chat.messages[0].content, Some(json!(" \n ")));
+    }
+
+    #[test]
+    fn test_empty_input_still_produces_one_message() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, "user");
+    }
+
+    #[test]
     fn test_blank_history_system_does_not_suppress_instructions() {
         let sessions = SessionStore::new();
         let mut req = base_req(ResponsesInput::Text("hi".into()));
@@ -1210,6 +1277,43 @@ mod tests {
         assert_eq!(calls[1]["id"], "c2");
         assert_eq!(chat.messages[1].tool_call_id.as_deref(), Some("c1"));
         assert_eq!(chat.messages[2].tool_call_id.as_deref(), Some("c2"));
+    }
+
+    #[test]
+    fn test_duplicate_tool_call_ids_across_blank_messages_are_skipped() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "function_call", "call_id": "c1", "name": "first", "arguments": "{}"}),
+            json!({"type": "message", "role": "user", "content": ""}),
+            json!({"type": "function_call", "call_id": "c1", "name": "duplicate", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "c1", "output": "one"}),
+            json!({"type": "function_call_output", "call_id": "c1", "output": "duplicate output"}),
+        ]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages.len(), 2);
+        let calls = chat.messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "first");
+        assert_eq!(chat.messages[1].text_content(), "one");
+    }
+
+    #[test]
+    fn test_duplicate_tool_call_in_later_group_does_not_create_empty_assistant() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![
+            json!({"type": "function_call", "call_id": "c1", "name": "first", "arguments": "{}"}),
+            json!({"type": "message", "role": "developer", "content": "rules"}),
+            json!({"type": "function_call", "call_id": "c1", "name": "duplicate", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "c1", "output": "done"}),
+        ]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        let roles: Vec<&str> = chat.messages.iter().map(|msg| msg.role.as_str()).collect();
+        assert_eq!(roles, ["system", "assistant", "tool"]);
+        assert_eq!(chat.messages[1].tool_calls.as_ref().unwrap().len(), 1);
+        assert!(chat.messages.iter().all(|msg| msg
+            .tool_calls
+            .as_ref()
+            .is_none_or(|calls| !calls.is_empty())));
     }
 
     #[test]
@@ -1451,6 +1555,18 @@ mod tests {
         assert_eq!(chat.messages[0].role, "tool");
         assert_eq!(chat.messages[0].text_content(), "result");
         assert_eq!(chat.messages[0].tool_call_id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn test_non_string_function_call_output_is_not_lost() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![json!({
+            "type": "function_call_output",
+            "call_id": "c1",
+            "output": {"ok": true, "count": 2}
+        })]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(chat.messages[0].text_content(), r#"{"count":2,"ok":true}"#);
     }
 
     #[test]

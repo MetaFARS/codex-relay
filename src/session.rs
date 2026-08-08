@@ -173,18 +173,18 @@ impl SessionStore {
     /// of the assistant message content and tool calls.
     pub fn store_turn_reasoning(
         &self,
-        _prior: &[ChatMessage],
+        prior: &[ChatMessage],
         assistant: &ChatMessage,
         reasoning: String,
     ) {
         if !reasoning.is_empty() {
             let mut state = self.state.lock().expect("session store mutex poisoned");
 
-            // Store under content-only key so lookups work even when Codex
-            // replays the assistant text and function_calls as separate items.
+            // Store under a replay-visible turn key so identical assistant
+            // text in different conversations cannot overwrite reasoning.
             let content = assistant.text_content();
             if !content.is_empty() {
-                let key = Self::content_key(content);
+                let key = Self::turn_key(prior, assistant);
                 state.insert_turn_reasoning(key, reasoning.clone());
             }
             // Also store under each tool call_id (existing mechanism).
@@ -204,14 +204,14 @@ impl SessionStore {
     /// Look up reasoning_content for an assistant turn by its text content.
     pub fn get_turn_reasoning(
         &self,
-        _prior: &[ChatMessage],
+        prior: &[ChatMessage],
         assistant: &ChatMessage,
     ) -> Option<String> {
         let content = assistant.text_content();
         if content.is_empty() {
             return None;
         }
-        let key = Self::content_key(content);
+        let key = Self::turn_key(prior, assistant);
         let mut state = self.state.lock().expect("session store mutex poisoned");
         state.enforce_limits();
         let value = state.load_turn_reasoning_value(key);
@@ -221,10 +221,28 @@ impl SessionStore {
         value
     }
 
-    /// Hash assistant message content for turn-level reasoning lookup.
-    fn content_key(content: &str) -> u64 {
+    /// Hash replay-visible prior messages and assistant shape while excluding
+    /// reasoning_content itself, which is the value this key recovers.
+    fn turn_key(prior: &[ChatMessage], assistant: &ChatMessage) -> u64 {
         let mut hasher = DefaultHasher::new();
-        content.hash(&mut hasher);
+        for message in prior {
+            message.role.hash(&mut hasher);
+            serde_json::to_string(&(
+                &message.content,
+                &message.tool_calls,
+                &message.tool_call_id,
+                &message.name,
+            ))
+            .expect("chat message fields serialize")
+            .hash(&mut hasher);
+        }
+        // Codex replays assistant text and function calls as separate items,
+        // so the text-message key must not depend on tool_calls. Those are
+        // indexed independently by call_id above.
+        assistant.role.hash(&mut hasher);
+        serde_json::to_string(&(&assistant.content, &assistant.name))
+            .expect("assistant message fields serialize")
+            .hash(&mut hasher);
         hasher.finish()
     }
 
@@ -962,12 +980,33 @@ mod tests {
     }
 
     #[test]
-    fn test_content_key_deterministic() {
-        let a = SessionStore::content_key("same text");
-        let b = SessionStore::content_key("same text");
+    fn test_turn_key_is_deterministic_and_includes_prior() {
+        let assistant = msg("assistant", Some("same text"));
+        let prior = vec![msg("user", Some("question one"))];
+        let a = SessionStore::turn_key(&prior, &assistant);
+        let b = SessionStore::turn_key(&prior, &assistant);
         assert_eq!(a, b);
-        let c = SessionStore::content_key("different");
+        let c = SessionStore::turn_key(&[msg("user", Some("question two"))], &assistant);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_turn_reasoning_does_not_cross_identical_assistant_text() {
+        let store = SessionStore::new();
+        let assistant = msg("assistant", Some("OK"));
+        let first_prior = vec![msg("user", Some("first"))];
+        let second_prior = vec![msg("user", Some("second"))];
+        store.store_turn_reasoning(&first_prior, &assistant, "first reasoning".into());
+        store.store_turn_reasoning(&second_prior, &assistant, "second reasoning".into());
+
+        assert_eq!(
+            store.get_turn_reasoning(&first_prior, &assistant),
+            Some("first reasoning".into())
+        );
+        assert_eq!(
+            store.get_turn_reasoning(&second_prior, &assistant),
+            Some("second reasoning".into())
+        );
     }
 
     #[test]

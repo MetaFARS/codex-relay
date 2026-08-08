@@ -47,8 +47,6 @@ pub struct ThinkSplit {
 pub struct ThinkStreamFilter {
     pending: String,
     in_think: bool,
-    emitted_text: bool,
-    trim_after_close: bool,
     fired: bool,
     enabled: bool,
 }
@@ -66,8 +64,6 @@ impl ThinkStreamFilter {
         Self {
             pending: String::new(),
             in_think: false,
-            emitted_text: false,
-            trim_after_close: false,
             fired: false,
             enabled,
         }
@@ -92,7 +88,6 @@ impl ThinkStreamFilter {
                     out.reasoning.push_str(&self.pending[..at]);
                     self.pending.drain(..at + tag.len());
                     self.in_think = false;
-                    self.trim_after_close = !self.emitted_text;
                     continue;
                 }
                 let keep =
@@ -100,23 +95,6 @@ impl ThinkStreamFilter {
                 out.reasoning.push_str(&self.pending[..keep]);
                 self.pending.drain(..keep);
                 return out;
-            }
-
-            if self.trim_after_close {
-                let first_non_whitespace = self
-                    .pending
-                    .char_indices()
-                    .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(index));
-                match first_non_whitespace {
-                    Some(index) => {
-                        self.pending.drain(..index);
-                        self.trim_after_close = false;
-                    }
-                    None => {
-                        self.pending.clear();
-                        return out;
-                    }
-                }
             }
 
             match first_tag(&self.pending, OPEN_TAGS) {
@@ -145,11 +123,7 @@ impl ThinkStreamFilter {
         if self.in_think {
             out.reasoning = rest;
         } else {
-            out.text = if self.trim_after_close && !self.emitted_text {
-                rest.trim_start().to_string()
-            } else {
-                rest
-            };
+            out.text = rest;
         }
         out
     }
@@ -158,7 +132,6 @@ impl ThinkStreamFilter {
     fn emit_text(&mut self, out: &mut ThinkSplit, upto: usize) {
         let chunk = &self.pending[..upto];
         if !chunk.is_empty() {
-            self.emitted_text = true;
             out.text.push_str(chunk);
         }
     }
@@ -171,26 +144,15 @@ pub fn heal_chat_message(message: &mut ChatMessage) {
     if !contains_think_markup(&text) {
         return;
     }
-    let (split, fired) = if first_tag(&text, OPEN_TAGS).is_none() {
-        match first_tag(&text, CLOSE_TAGS) {
-            Some((at, tag)) => (
-                ThinkSplit {
-                    reasoning: text[..at].to_string(),
-                    text: text[at + tag.len()..].trim_start().to_string(),
-                },
-                true,
-            ),
-            None => (ThinkSplit::default(), false),
-        }
-    } else {
-        let mut filter = ThinkStreamFilter::new(true);
-        let mut split = filter.push(&text);
-        let fired = filter.fired();
-        let tail = filter.finish();
-        split.reasoning.push_str(&tail.reasoning);
-        split.text.push_str(&tail.text);
-        (split, fired)
-    };
+    if first_tag(&text, OPEN_TAGS).is_none() {
+        return;
+    }
+    let mut filter = ThinkStreamFilter::new(true);
+    let mut split = filter.push(&text);
+    let fired = filter.fired();
+    let tail = filter.finish();
+    split.reasoning.push_str(&tail.reasoning);
+    split.text.push_str(&tail.text);
     if !fired {
         return;
     }
@@ -261,7 +223,7 @@ mod tests {
     fn splits_a_complete_think_block() {
         let out = run(&["<think>musing</think>\n\nHello!"]);
         assert_eq!(out.reasoning, "musing");
-        assert_eq!(out.text, "Hello!");
+        assert_eq!(out.text, "\n\nHello!");
     }
 
     #[test]
@@ -298,6 +260,12 @@ mod tests {
         let expected = run(&["<think>musing</think>Hi"]);
         assert_eq!(expected, run(&["<thi", "nk>musing</th", "ink>Hi"]));
         assert_eq!(expected, run(&["<think>musing</think>", "Hi"]));
+    }
+
+    #[test]
+    fn preserves_whitespace_after_think_block() {
+        assert_eq!(run(&["<think>x</think>  indented"]).text, "  indented");
+        assert_eq!(run(&["<think>x</think>\n    code"]).text, "\n    code");
     }
 
     #[test]
@@ -356,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn heals_blocking_message_with_prefilled_open_tag() {
+    fn blocking_bare_close_tag_stays_visible_like_streaming() {
         let mut message = ChatMessage {
             role: "assistant".into(),
             content: Some("musing</think>Hi".into()),
@@ -366,8 +334,8 @@ mod tests {
             name: None,
         };
         heal_chat_message(&mut message);
-        assert_eq!(message.text_content(), "Hi");
-        assert_eq!(message.reasoning_content.as_deref(), Some("musing"));
+        assert_eq!(message.text_content(), "musing</think>Hi");
+        assert!(message.reasoning_content.is_none());
     }
 
     #[test]

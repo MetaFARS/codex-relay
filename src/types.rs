@@ -232,6 +232,8 @@ pub struct ChatStreamChunk {
 
 #[derive(Debug, Deserialize)]
 pub struct ChatStreamChoice {
+    #[serde(default)]
+    pub index: usize,
     pub delta: ChatDelta,
     /// Upstream end-of-turn signal. Used by stream.rs to tell a provider that
     /// merely omitted `[DONE]` from a connection that died mid-generation.

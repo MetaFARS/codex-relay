@@ -388,7 +388,7 @@ async fn dsml_leak_streaming_heals_into_function_call_events() {
         json!({"choices": [{"delta": {"content": "我来读取文件。"}}]}),
         json!({"choices": [{"delta": {"content": "<｜DS"}}]}),
         json!({"choices": [{"delta": {"content": "ML｜tool_calls>\n<｜DSML｜invoke name=\"shell\">\n"}}]}),
-        json!({"choices": [{"delta": {"content": "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la</｜DSML｜parameter>\n</｜DSML｜invoke>\n"}}]}),
+        json!({"choices": [{"delta": {"content": "<｜DSML｜parameter name=\"command\" string=\"true\">echo <think>secret</think></｜DSML｜parameter>\n</｜DSML｜invoke>\n"}}]}),
         json!({"choices": [{"delta": {"content": "</｜DSML｜tool_calls>"}}]}),
         json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}),
     ]);
@@ -423,7 +423,13 @@ async fn dsml_leak_streaming_heals_into_function_call_events() {
         .expect("healed function_call done item");
     assert_eq!(fc_done["name"], "shell");
     let args: Value = serde_json::from_str(fc_done["arguments"].as_str().unwrap()).unwrap();
-    assert_eq!(args["command"], "ls -la");
+    assert_eq!(args["command"], "echo <think>secret</think>");
+    assert!(
+        events
+            .iter()
+            .all(|(event, _)| event != "response.reasoning_summary_text.delta"),
+        "think-like text inside DSML arguments is tool data, not reasoning"
+    );
     assert!(fc_done["call_id"]
         .as_str()
         .unwrap()
@@ -1123,6 +1129,127 @@ async fn issue_31_truncated_stream_without_finish_reason_fails() {
         events.iter().any(|(event, _)| event == "response.failed"),
         "truncated turn must not be reported as completed"
     );
+    assert!(
+        events
+            .iter()
+            .all(|(event, _)| event != "response.output_item.done"),
+        "failed stream must not finalize partial output items"
+    );
+}
+
+#[tokio::test]
+async fn issue_46_truncated_tool_call_is_never_finalized() {
+    let truncated = sse_from_chunks_without_done(vec![json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_danger",
+                    "function": {"name": "dangerous_tool", "arguments": "{\"path\":\"/tmp/x\"}"}
+                }]
+            }
+        }]
+    })]);
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![truncated]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({"model": "mock-model", "input": "act", "tools": [], "stream": true}),
+    )
+    .await;
+
+    assert!(events.iter().any(|(event, _)| event == "response.failed"));
+    assert!(events
+        .iter()
+        .all(|(event, _)| event != "response.output_item.done"));
+    assert!(events
+        .iter()
+        .all(|(event, _)| event != "response.completed"));
+}
+
+#[tokio::test]
+async fn issue_46_embedded_upstream_error_fails_even_with_done() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+        "data: {\"choices\":[],\"error\":{\"message\":\"upstream quota exceeded\"}}\n\n",
+        "data: [DONE]\n\n"
+    )
+    .to_string();
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({"model": "mock-model", "input": "Say hi.", "tools": [], "stream": true}),
+    )
+    .await;
+
+    let failed = events
+        .iter()
+        .find_map(|(event, data)| (event == "response.failed").then_some(data))
+        .expect("response.failed");
+    assert_eq!(
+        failed["response"]["error"]["message"],
+        "upstream quota exceeded"
+    );
+    assert!(events
+        .iter()
+        .all(|(event, _)| event != "response.output_item.done"));
+    assert!(events
+        .iter()
+        .all(|(event, _)| event != "response.completed"));
+}
+
+#[tokio::test]
+async fn issue_46_choice_after_finish_reason_fails() {
+    let sse = sse_from_chunks_without_done(vec![
+        json!({"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}),
+        json!({"choices":[{"index":0,"delta":{"tool_calls":[{
+            "index":0,"id":"late_call","function":{"name":"dangerous_tool","arguments":"{}"}
+        }]}}]}),
+    ]);
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({"model": "mock-model", "input": "act", "tools": [], "stream": true}),
+    )
+    .await;
+
+    assert!(events.iter().any(|(event, _)| event == "response.failed"));
+    assert!(events
+        .iter()
+        .all(|(event, _)| event != "response.output_item.done"));
+    assert!(events
+        .iter()
+        .all(|(event, _)| event != "response.completed"));
+}
+
+#[tokio::test]
+async fn issue_46_blocking_embedded_error_is_not_persisted_as_success() {
+    let (upstream_port, _bodies) = spawn_blocking_mock_upstream(vec![json!({
+        "choices": [],
+        "error": {"message": "quota exceeded"}
+    })])
+    .await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let response = reqwest::Client::new()
+        .post(relay.url("/v1/responses"))
+        .json(&json!({
+            "model": "mock-model",
+            "input": "Say hi.",
+            "tools": [],
+            "stream": false
+        }))
+        .send()
+        .await
+        .expect("relay response");
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    assert!(response.text().await.unwrap().contains("quota exceeded"));
 }
 
 #[tokio::test]
@@ -1155,7 +1282,10 @@ async fn think_tags_leaked_into_content_are_routed_to_reasoning() {
         .filter_map(|(_, data)| data["delta"].as_str())
         .collect();
 
-    assert_eq!(text, "Hello!", "think markup must not reach visible text");
+    assert_eq!(
+        text, "\n\nHello!",
+        "think markup must not reach visible text or consume surrounding whitespace"
+    );
     assert_eq!(reasoning, "musing");
 }
 

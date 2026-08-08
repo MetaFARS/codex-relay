@@ -41,6 +41,7 @@
 //! tag has no body, so its value can only live in an attribute.
 
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
 use crate::types::ChatMessage;
 
@@ -103,132 +104,325 @@ pub struct DsmlToolCall {
 /// complete `<｜DSML｜invoke>` block could be parsed (the text is then left
 /// untouched so nothing is lost).
 pub fn parse_leaked_tool_calls(text: &str) -> Option<(String, Vec<DsmlToolCall>)> {
-    let (dialect, _) = detect_dialect(text)?;
     let mut calls = Vec::new();
     let mut cleaned = String::new();
-    let mut rest = text;
+    let mut copied_through = 0;
+    let mut search_from = 0;
 
-    while let Some(start) = rest.find(dialect.invoke_open) {
-        let header_start = start + dialect.invoke_open.len();
-        let Some(header_len) = unquoted_char(&rest[header_start..], '>') else {
-            break;
-        };
-        let header = &rest[header_start..header_start + header_len];
-        let body_start = header_start + header_len + 1;
-        let Some(body_len) = rest[body_start..].find(dialect.invoke_close) else {
-            break;
-        };
-        let Some(name) = attribute(header, "name") else {
-            break;
-        };
-        let arguments = parse_parameters(&rest[body_start..body_start + body_len], dialect);
-        calls.push(DsmlToolCall {
-            name: name.to_string(),
-            arguments: Value::Object(arguments).to_string(),
-        });
-        cleaned.push_str(&rest[..start]);
-        rest = &rest[body_start + body_len + dialect.invoke_close.len()..];
+    while let Some((dialect, start)) = find_next_invoke(text, search_from) {
+        match parse_invoke(text, start, dialect) {
+            Ok((end, call)) => {
+                let removal_start = envelope_start(text, copied_through, start, dialect);
+                let removal_end = envelope_end(text, end, dialect);
+                cleaned.push_str(&text[copied_through..removal_start]);
+                calls.push(call);
+                copied_through = removal_end;
+                search_from = removal_end;
+            }
+            Err(()) => {
+                // Preserve malformed candidates byte-for-byte, but continue so
+                // an unrelated valid call later in the message can still heal.
+                let Some(end) = malformed_invoke_end(text, start, dialect) else {
+                    break;
+                };
+                search_from = end;
+            }
+        }
     }
 
     if calls.is_empty() {
         return None;
     }
-    cleaned.push_str(rest);
-    let cleaned = cleaned
-        .replace(dialect.calls_open, "")
-        .replace(dialect.calls_close, "");
+    cleaned.push_str(&text[copied_through..]);
     Some((cleaned.trim().to_string(), calls))
 }
 
-/// Parse the parameter tags inside one `invoke` body.
-///
-/// Tags are matched on the dialect marker rather than on a fixed tag name:
-/// single-bar leaks name them `parameter`, double-bar leaks reuse `invoke`.
-/// What actually distinguishes a value's location is the tag's *shape*:
-///
-/// - self-closing (`… />`) — no body exists, so the value is the `string`
-///   attribute (double-bar form).
-/// - with a body — the value is the body text, and `string="false"` marks it
-///   as a non-string JSON literal (single-bar form).
-fn parse_parameters(body: &str, dialect: DsmlDialect) -> serde_json::Map<String, Value> {
-    let mut arguments = serde_json::Map::new();
-    let mut rest = body;
-    while let Some(start) = rest.find(dialect.marker) {
-        let header_start = start + dialect.marker.len();
-        let Some(header_len) = unquoted_char(&rest[header_start..], '>') else {
-            break;
-        };
-        let header = &rest[header_start..header_start + header_len];
-        let after_tag = header_start + header_len + 1;
-
-        let Some(tag) = header.split_whitespace().next() else {
-            break;
-        };
-        // A closing tag (`</…invoke>`) means the enclosing element ended; the
-        // marker search cannot see `</` because the marker starts with `<`, so
-        // this only guards against a malformed header.
-        if tag.starts_with('/') {
-            rest = &rest[after_tag..];
-            continue;
-        }
-
-        if header.trim_end().ends_with('/') {
-            if let Some(name) = attribute(header, "name") {
-                let value = attribute(header, "string").unwrap_or_default();
-                arguments.insert(name.to_string(), Value::String(value.to_string()));
-            }
-            rest = &rest[after_tag..];
-            continue;
-        }
-
-        let close = format!("</{}{}>", dialect.marker.trim_start_matches('<'), tag);
-        let Some(value_len) = rest[after_tag..].find(&close) else {
-            break;
-        };
-        let raw = &rest[after_tag..after_tag + value_len];
-        if let Some(name) = attribute(header, "name") {
-            // string="false" marks a non-string JSON value (number, bool, ...).
-            let value = if attribute(header, "string") == Some("false") {
-                serde_json::from_str::<Value>(raw.trim())
-                    .unwrap_or_else(|_| Value::String(raw.to_string()))
-            } else {
-                Value::String(raw.to_string())
-            };
-            arguments.insert(name.to_string(), value);
-        }
-        rest = &rest[after_tag + value_len + close.len()..];
-    }
-    arguments
+#[derive(Debug)]
+struct ParsedTag {
+    name: String,
+    attrs: BTreeMap<String, String>,
+    self_closing: bool,
+    end: usize,
 }
 
-/// Byte offset of the first `needle` in `text` that is outside double quotes.
-fn unquoted_char(text: &str, needle: char) -> Option<usize> {
-    let mut in_quotes = false;
-    for (i, c) in text.char_indices() {
-        match c {
-            '"' => in_quotes = !in_quotes,
-            c if c == needle && !in_quotes => return Some(i),
-            _ => {}
+fn find_next_invoke(text: &str, from: usize) -> Option<(DsmlDialect, usize)> {
+    DIALECTS
+        .iter()
+        .filter_map(|dialect| {
+            let mut offset = from;
+            while let Some(found) = text[offset..].find(dialect.invoke_open) {
+                let start = offset + found;
+                let after = start + dialect.invoke_open.len();
+                if text[after..]
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_whitespace() || ch == '>')
+                {
+                    return Some((*dialect, start));
+                }
+                offset = after;
+            }
+            None
+        })
+        .min_by_key(|(_, start)| *start)
+}
+
+fn parse_invoke(
+    text: &str,
+    start: usize,
+    dialect: DsmlDialect,
+) -> Result<(usize, DsmlToolCall), ()> {
+    let invoke = parse_open_tag(text, start, dialect)?;
+    if invoke.name != "invoke" || invoke.self_closing {
+        return Err(());
+    }
+    let name = invoke
+        .attrs
+        .get("name")
+        .filter(|name| !name.is_empty())
+        .ok_or(())?;
+    let mut arguments = serde_json::Map::new();
+    let mut cursor = invoke.end;
+
+    loop {
+        cursor = skip_whitespace(text, cursor);
+        if text[cursor..].starts_with(dialect.invoke_close) {
+            let end = cursor + dialect.invoke_close.len();
+            return Ok((
+                end,
+                DsmlToolCall {
+                    name: name.clone(),
+                    arguments: Value::Object(arguments).to_string(),
+                },
+            ));
+        }
+        if !text[cursor..].starts_with(dialect.marker) {
+            return Err(());
+        }
+
+        let parameter = parse_open_tag(text, cursor, dialect)?;
+        let parameter_name = parameter
+            .attrs
+            .get("name")
+            .filter(|name| !name.is_empty())
+            .ok_or(())?
+            .clone();
+        if arguments.contains_key(&parameter_name) {
+            return Err(());
+        }
+
+        let value = if dialect == DOUBLE_BAR && parameter.name == "invoke" && parameter.self_closing
+        {
+            Value::String(parameter.attrs.get("string").ok_or(())?.clone())
+        } else if parameter.name == "parameter" && !parameter.self_closing {
+            let string_kind = parameter
+                .attrs
+                .get("string")
+                .map(String::as_str)
+                .ok_or(())?;
+            if !matches!(string_kind, "true" | "false") {
+                return Err(());
+            }
+            let close = format!("</{}parameter>", dialect.marker.trim_start_matches('<'));
+            let tail = &text[parameter.end..];
+            let close_offset = tail.find(&close).ok_or(())?;
+            if tail
+                .find(dialect.marker)
+                .into_iter()
+                .chain(tail.find(dialect.invoke_close))
+                .any(|offset| offset < close_offset)
+            {
+                return Err(());
+            }
+            let close_at = parameter.end + close_offset;
+            let raw = &text[parameter.end..close_at];
+            cursor = close_at + close.len();
+            if string_kind == "false" {
+                serde_json::from_str(raw.trim()).map_err(|_| ())?
+            } else {
+                Value::String(raw.to_string())
+            }
+        } else {
+            return Err(());
+        };
+        if parameter.self_closing {
+            cursor = parameter.end;
+        }
+        arguments.insert(parameter_name, value);
+    }
+}
+
+/// Find the balanced end of a malformed invoke so recovery never descends
+/// into a nested, valid-looking call and executes it out of context.
+fn malformed_invoke_end(text: &str, start: usize, dialect: DsmlDialect) -> Option<usize> {
+    let outer = parse_open_tag(text, start, dialect).ok()?;
+    if outer.name != "invoke" || outer.self_closing {
+        return Some(outer.end);
+    }
+    let mut depth = 1usize;
+    let mut cursor = outer.end;
+    while cursor < text.len() {
+        let next_open = text[cursor..]
+            .find(dialect.marker)
+            .map(|offset| cursor + offset);
+        let next_close = text[cursor..]
+            .find(dialect.invoke_close)
+            .map(|offset| cursor + offset);
+        match (next_open, next_close) {
+            (None, Some(close)) => {
+                depth -= 1;
+                cursor = close + dialect.invoke_close.len();
+                if depth == 0 {
+                    return Some(cursor);
+                }
+            }
+            (Some(open), Some(close)) if close < open => {
+                depth -= 1;
+                cursor = close + dialect.invoke_close.len();
+                if depth == 0 {
+                    return Some(cursor);
+                }
+            }
+            (Some(open), _) => {
+                let tag = parse_open_tag(text, open, dialect).ok()?;
+                if tag.name == "invoke" && !tag.self_closing {
+                    depth += 1;
+                }
+                cursor = tag.end;
+            }
+            (None, None) => return None,
         }
     }
     None
 }
 
-/// Extract a `key="value"` attribute from a DSML tag header.
-fn attribute<'a>(header: &'a str, key: &str) -> Option<&'a str> {
-    let mut rest = header;
-    loop {
-        let start = rest.find(key)?;
-        let after = &rest[start + key.len()..];
-        // Guard against matching `name` inside another attribute's key.
-        let preceded_ok = rest[..start].ends_with(char::is_whitespace) || start == 0;
-        if preceded_ok {
-            if let Some(after_eq) = after.strip_prefix("=\"") {
-                let end = after_eq.find('"')?;
-                return Some(&after_eq[..end]);
-            }
+fn parse_open_tag(text: &str, start: usize, dialect: DsmlDialect) -> Result<ParsedTag, ()> {
+    if !text[start..].starts_with(dialect.marker) {
+        return Err(());
+    }
+    let mut cursor = start + dialect.marker.len();
+    let name_start = cursor;
+    while let Some(ch) = text[cursor..].chars().next() {
+        if ch.is_whitespace() || matches!(ch, '/' | '>') {
+            break;
         }
-        rest = after;
+        cursor += ch.len_utf8();
+    }
+    if cursor == name_start {
+        return Err(());
+    }
+    let name = text[name_start..cursor].to_string();
+    let mut attrs = BTreeMap::new();
+
+    loop {
+        cursor = skip_whitespace(text, cursor);
+        match text[cursor..].chars().next().ok_or(())? {
+            '>' => {
+                return Ok(ParsedTag {
+                    name,
+                    attrs,
+                    self_closing: false,
+                    end: cursor + 1,
+                });
+            }
+            '/' => {
+                cursor += 1;
+                cursor = skip_whitespace(text, cursor);
+                if !text[cursor..].starts_with('>') {
+                    return Err(());
+                }
+                return Ok(ParsedTag {
+                    name,
+                    attrs,
+                    self_closing: true,
+                    end: cursor + 1,
+                });
+            }
+            _ => {}
+        }
+
+        let key_start = cursor;
+        while let Some(ch) = text[cursor..].chars().next() {
+            if ch.is_whitespace() || ch == '=' {
+                break;
+            }
+            if matches!(ch, '/' | '>') {
+                return Err(());
+            }
+            cursor += ch.len_utf8();
+        }
+        if cursor == key_start {
+            return Err(());
+        }
+        let key = text[key_start..cursor].to_string();
+        cursor = skip_whitespace(text, cursor);
+        if !text[cursor..].starts_with('=') {
+            return Err(());
+        }
+        cursor += 1;
+        cursor = skip_whitespace(text, cursor);
+        if !text[cursor..].starts_with('"') {
+            return Err(());
+        }
+        cursor += 1;
+        let (value, end) = parse_quoted_value(text, cursor)?;
+        cursor = end;
+        if attrs.insert(key, value).is_some() {
+            return Err(());
+        }
+    }
+}
+
+fn parse_quoted_value(text: &str, mut cursor: usize) -> Result<(String, usize), ()> {
+    let mut value = String::new();
+    loop {
+        let ch = text[cursor..].chars().next().ok_or(())?;
+        cursor += ch.len_utf8();
+        match ch {
+            '"' => return Ok((value, cursor)),
+            '\\' => {
+                let escaped = text[cursor..].chars().next().ok_or(())?;
+                if matches!(escaped, '"' | '\\') {
+                    value.push(escaped);
+                    cursor += escaped.len_utf8();
+                } else {
+                    value.push('\\');
+                }
+            }
+            other => value.push(other),
+        }
+    }
+}
+
+fn skip_whitespace(text: &str, mut cursor: usize) -> usize {
+    while let Some(ch) = text[cursor..].chars().next() {
+        if !ch.is_whitespace() {
+            break;
+        }
+        cursor += ch.len_utf8();
+    }
+    cursor
+}
+
+fn envelope_start(
+    text: &str,
+    copied_through: usize,
+    invoke_start: usize,
+    dialect: DsmlDialect,
+) -> usize {
+    let prefix = &text[copied_through..invoke_start];
+    prefix
+        .rfind(dialect.calls_open)
+        .filter(|at| prefix[at + dialect.calls_open.len()..].trim().is_empty())
+        .map_or(invoke_start, |at| copied_through + at)
+}
+
+fn envelope_end(text: &str, invoke_end: usize, dialect: DsmlDialect) -> usize {
+    let after_whitespace = skip_whitespace(text, invoke_end);
+    if text[after_whitespace..].starts_with(dialect.calls_close) {
+        after_whitespace + dialect.calls_close.len()
+    } else {
+        invoke_end
     }
 }
 
@@ -427,6 +621,17 @@ mod tests {
     }
 
     #[test]
+    fn double_bar_attribute_parser_handles_escapes_and_tag_text() {
+        let text = "<｜｜DSML｜｜invoke name=\"exec_command\">\n<｜｜DSML｜｜invoke name=\"cmd\" string=\"printf \\\"a>b\\\" C:\\temp\\file </｜｜DSML｜｜invoke>\" />\n</｜｜DSML｜｜invoke>";
+        let (_, calls) = parse_leaked_tool_calls(text).expect("healed");
+        let args: Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(
+            args["cmd"],
+            "printf \"a>b\" C:\\temp\\file </｜｜DSML｜｜invoke>"
+        );
+    }
+
+    #[test]
     fn double_bar_supports_bodied_parameters_too() {
         // Not observed in the wild, but the dialect differs only in the
         // delimiter; a bodied parameter must not silently drop its value.
@@ -435,6 +640,80 @@ mod tests {
         let args: Value = serde_json::from_str(&calls[0].arguments).unwrap();
         assert_eq!(args["command"], "ls -la");
         assert_eq!(args["timeout"], 15);
+    }
+
+    #[test]
+    fn parses_mixed_dialects_in_source_order() {
+        for text in [
+            format!("{ENVELOPE}\n{DOUBLE_BAR_ENVELOPE}"),
+            format!("{DOUBLE_BAR_ENVELOPE}\n{ENVELOPE}"),
+        ] {
+            let (cleaned, calls) = parse_leaked_tool_calls(&text).expect("healed");
+            assert_eq!(cleaned, "");
+            assert_eq!(calls.len(), 2);
+            if text.starts_with("<｜DSML｜") {
+                assert_eq!(calls[0].name, "shell");
+                assert_eq!(calls[1].name, "exec_command");
+            } else {
+                assert_eq!(calls[0].name, "exec_command");
+                assert_eq!(calls[1].name, "shell");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_marker_does_not_block_later_valid_dialect() {
+        let malformed = "<｜DSML｜invoke_extra name=\"not_a_call\">raw</｜DSML｜invoke_extra>";
+        let text = format!("{malformed}\n{DOUBLE_BAR_ENVELOPE}");
+        let (cleaned, calls) = parse_leaked_tool_calls(&text).expect("later call healed");
+        assert_eq!(cleaned, malformed);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "exec_command");
+    }
+
+    #[test]
+    fn malformed_calls_fail_closed() {
+        let cases = [
+            "<｜｜DSML｜｜invoke_extra name=\"exec_command\"></｜｜DSML｜｜invoke>",
+            "<｜｜DSML｜｜invoke name=\"exec_command\"><｜｜DSML｜｜metadata name=\"cmd\" string=\"echo bad\" /></｜｜DSML｜｜invoke>",
+            "<｜｜DSML｜｜invoke name=\"exec_command\"><｜｜DSML｜｜invoke name=\"cmd\" /></｜｜DSML｜｜invoke>",
+            "<｜｜DSML｜｜invoke name=\"exec_command\" name=\"other\"></｜｜DSML｜｜invoke>",
+            "<｜｜DSML｜｜invoke name=\"exec_command\"><｜｜DSML｜｜invoke name=\"cmd\" string=\"one\" /><｜｜DSML｜｜invoke name=\"cmd\" string=\"two\" /></｜｜DSML｜｜invoke>",
+            "<｜｜DSML｜｜invoke name=\"exec_command\"><｜｜DSML｜｜invoke name=\"cmd\" string=\"unterminated /></｜｜DSML｜｜invoke>",
+        ];
+        for text in cases {
+            assert!(
+                parse_leaked_tool_calls(text).is_none(),
+                "malformed DSML must not execute: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_call_is_preserved_when_later_call_heals() {
+        let malformed =
+            "<｜｜DSML｜｜invoke name=\"bad\"><｜｜DSML｜｜invoke name=\"cmd\" /></｜｜DSML｜｜invoke>";
+        let text = format!("{malformed}\n{ENVELOPE}");
+        let (cleaned, calls) = parse_leaked_tool_calls(&text).expect("later call healed");
+        assert_eq!(cleaned, malformed);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+    }
+
+    #[test]
+    fn nested_call_inside_malformed_invoke_never_executes() {
+        let malformed = "<｜｜DSML｜｜invoke name=\"bad\">\n<｜｜DSML｜｜invoke name=\"exec_command\">\n<｜｜DSML｜｜invoke name=\"cmd\" string=\"echo bad\" />\n</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜invoke>";
+        let text = format!("{malformed}\n{ENVELOPE}");
+        let (cleaned, calls) = parse_leaked_tool_calls(&text).expect("later sibling healed");
+        assert_eq!(cleaned, malformed);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+    }
+
+    #[test]
+    fn unclosed_parameter_cannot_borrow_close_from_nested_call() {
+        let text = "<｜DSML｜invoke name=\"shell\">\n<｜DSML｜parameter name=\"command\" string=\"true\">echo bad\n<｜DSML｜invoke name=\"shell\">\n<｜DSML｜parameter name=\"command\" string=\"true\">echo good</｜DSML｜parameter>\n</｜DSML｜invoke>";
+        assert!(parse_leaked_tool_calls(text).is_none());
     }
 
     #[test]
@@ -470,6 +749,21 @@ mod tests {
         assert_eq!(calls[0].name, "exec_command");
         let args: Value = serde_json::from_str(&calls[0].arguments).unwrap();
         assert_eq!(args["cmd"], "echo alpha");
+    }
+
+    #[test]
+    fn stream_filter_handles_mixed_dialects_one_character_at_a_time() {
+        let text = format!("prefix\n{ENVELOPE}\n{DOUBLE_BAR_ENVELOPE}");
+        let mut filter = DsmlStreamFilter::default();
+        let mut emitted = String::new();
+        for ch in text.chars() {
+            emitted.push_str(&filter.push(&ch.to_string()));
+        }
+        let (leftover, calls) = filter.finish();
+        assert_eq!(format!("{emitted}{leftover}"), "prefix\n");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[1].name, "exec_command");
     }
 
     #[test]

@@ -3,6 +3,7 @@ name: Publish
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -10,6 +11,7 @@ permissions:
 jobs:
   # ── PyPI wheels (multi-platform via maturin-action) ───────────────────────
   build-wheels:
+    if: github.event_name == 'push'
     name: wheel ${{ matrix.platform.artifact }}
     strategy:
       fail-fast: false
@@ -117,6 +119,7 @@ jobs:
           path: dist
 
   windows-python-smoke:
+    if: github.event_name == 'push'
     needs: build-wheels
     runs-on: windows-latest
     strategy:
@@ -141,6 +144,7 @@ jobs:
           codex-relay --version
 
   build-sdist:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -156,14 +160,31 @@ jobs:
 
   publish-crates:
     needs: [build-wheels, windows-python-smoke, build-sdist]
+    if: >-
+      always() &&
+      (github.event_name == 'workflow_dispatch' ||
+       (needs.build-wheels.result == 'success' &&
+        needs.windows-python-smoke.result == 'success' &&
+        needs.build-sdist.result == 'success'))
     runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo publish --locked --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Authenticate with crates.io
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish to crates.io
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
 
   publish-pypi:
-    needs: [build-wheels, windows-python-smoke, build-sdist]
+    if: github.event_name == 'push'
+    needs: [build-wheels, windows-python-smoke, build-sdist, publish-crates]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

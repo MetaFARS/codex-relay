@@ -573,6 +573,19 @@ pub fn from_chat_response_with_tool_maps(
     tracing::debug!("cache(non-stream): {}", usage.cache_summary());
     let mut output = Vec::new();
 
+    if let Some(reasoning) = choice
+        .message
+        .reasoning_content
+        .as_deref()
+        .filter(|reasoning| !reasoning.is_empty())
+    {
+        output.push(json!({
+            "type": "reasoning",
+            "id": format!("rs_{}", uuid::Uuid::new_v4().simple()),
+            "summary": [{"type": "summary_text", "text": reasoning}]
+        }));
+    }
+
     let text = choice.message.text_content().to_string();
     if !text.is_empty() || choice.message.tool_calls.is_none() {
         output.push(json!({

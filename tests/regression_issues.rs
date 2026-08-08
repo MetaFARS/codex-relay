@@ -569,6 +569,29 @@ async fn chat_handler(State(state): State<MockState>, req: axum::extract::Reques
         .unwrap()
 }
 
+async fn blocking_chat_handler(
+    State(state): State<MockState>,
+    req: axum::extract::Request,
+) -> Response {
+    let bytes = axum::body::to_bytes(req.into_body(), 1_000_000)
+        .await
+        .expect("blocking chat request body");
+    let body: Value = serde_json::from_slice(&bytes).expect("blocking chat request json");
+    state.bodies.lock().unwrap().push(body);
+
+    let response = state
+        .responses
+        .lock()
+        .unwrap()
+        .pop_front()
+        .expect("blocking mock response");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(response))
+        .unwrap()
+}
+
 async fn delayed_chat_handler(
     State(state): State<MockState>,
     req: axum::extract::Request,
@@ -626,6 +649,17 @@ async fn spawn_mock_upstream_with_responses(
     responses: Vec<String>,
 ) -> (u16, Arc<Mutex<Vec<Value>>>) {
     spawn_mock_upstream_with_chat_handler(responses, chat_handler).await
+}
+
+async fn spawn_blocking_mock_upstream(responses: Vec<Value>) -> (u16, Arc<Mutex<Vec<Value>>>) {
+    spawn_mock_upstream_with_chat_handler(
+        responses
+            .into_iter()
+            .map(|response| response.to_string())
+            .collect(),
+        blocking_chat_handler,
+    )
+    .await
 }
 
 async fn spawn_delayed_mock_upstream() -> (u16, Arc<Mutex<Vec<Value>>>) {
@@ -1123,6 +1157,72 @@ async fn think_tags_leaked_into_content_are_routed_to_reasoning() {
 
     assert_eq!(text, "Hello!", "think markup must not reach visible text");
     assert_eq!(reasoning, "musing");
+}
+
+#[tokio::test]
+async fn blocking_think_tags_are_exposed_and_persisted_as_reasoning() {
+    let (upstream_port, bodies) = spawn_blocking_mock_upstream(vec![
+        json!({
+            "choices": [{"message": {
+                "role": "assistant",
+                "content": "<think>secret</think>answer"
+            }}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+        }),
+        json!({
+            "choices": [{"message": {"role": "assistant", "content": "next answer"}}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10}
+        }),
+    ])
+    .await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+    let client = reqwest::Client::new();
+
+    let first: Value = client
+        .post(relay.url("/v1/responses"))
+        .json(&json!({
+            "model": "mock-model",
+            "input": "first question",
+            "tools": [],
+            "stream": false
+        }))
+        .send()
+        .await
+        .expect("first blocking request")
+        .error_for_status()
+        .expect("first blocking response status")
+        .json()
+        .await
+        .expect("first blocking response json");
+    assert_eq!(first["output"][0]["type"], "reasoning");
+    assert_eq!(first["output"][0]["summary"][0]["text"], "secret");
+    assert_eq!(first["output"][1]["content"][0]["text"], "answer");
+
+    client
+        .post(relay.url("/v1/responses"))
+        .json(&json!({
+            "model": "mock-model",
+            "previous_response_id": first["id"],
+            "input": "second question",
+            "tools": [],
+            "stream": false
+        }))
+        .send()
+        .await
+        .expect("second blocking request")
+        .error_for_status()
+        .expect("second blocking response status");
+
+    let request_bodies = bodies.lock().unwrap();
+    let replayed = request_bodies[1]["messages"]
+        .as_array()
+        .expect("second request messages")
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("replayed assistant message");
+    assert_eq!(replayed["content"], "answer");
+    assert_eq!(replayed["reasoning_content"], "secret");
+    assert!(!request_bodies[1].to_string().contains("<think>"));
 }
 
 #[tokio::test]

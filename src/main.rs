@@ -580,10 +580,12 @@ async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes
     let req: ResponsesRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
-            error!("JSON parse error: {e}");
             error!(
-                "body prefix: {}",
-                String::from_utf8_lossy(&body[..body.len().min(200)])
+                error_category = ?e.classify(),
+                line = e.line(),
+                column = e.column(),
+                body_bytes = body.len(),
+                "JSON parse error"
             );
             return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response();
         }

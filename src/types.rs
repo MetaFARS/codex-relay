@@ -47,6 +47,9 @@ pub enum ResponsesInput {
     Messages(Vec<Value>),
 }
 
+// Public compatibility type. The binary compiles this module directly but
+// does not construct content parts itself, so it appears unused there.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct ContentPart {
     #[serde(rename = "type")]
@@ -230,7 +233,8 @@ pub struct ChatStreamChunk {
 #[derive(Debug, Deserialize)]
 pub struct ChatStreamChoice {
     pub delta: ChatDelta,
-    #[allow(dead_code)]
+    /// Upstream end-of-turn signal. Used by stream.rs to tell a provider that
+    /// merely omitted `[DONE]` from a connection that died mid-generation.
     pub finish_reason: Option<String>,
 }
 

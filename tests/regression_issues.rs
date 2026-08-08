@@ -569,6 +569,29 @@ async fn chat_handler(State(state): State<MockState>, req: axum::extract::Reques
         .unwrap()
 }
 
+async fn blocking_chat_handler(
+    State(state): State<MockState>,
+    req: axum::extract::Request,
+) -> Response {
+    let bytes = axum::body::to_bytes(req.into_body(), 1_000_000)
+        .await
+        .expect("blocking chat request body");
+    let body: Value = serde_json::from_slice(&bytes).expect("blocking chat request json");
+    state.bodies.lock().unwrap().push(body);
+
+    let response = state
+        .responses
+        .lock()
+        .unwrap()
+        .pop_front()
+        .expect("blocking mock response");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(response))
+        .unwrap()
+}
+
 async fn delayed_chat_handler(
     State(state): State<MockState>,
     req: axum::extract::Request,
@@ -598,6 +621,19 @@ fn sse_from_chunks_without_done(chunks: Vec<Value>) -> String {
     sse
 }
 
+/// `[DONE]` present but not terminated by a blank line, exactly as
+/// synthetic.new sends it (`...}}\n\ndata: [DONE]<EOF>`).
+fn sse_from_chunks_unterminated_done(chunks: Vec<Value>) -> String {
+    let mut sse = String::new();
+    for chunk in chunks {
+        sse.push_str("data: ");
+        sse.push_str(&chunk.to_string());
+        sse.push_str("\n\n");
+    }
+    sse.push_str("data: [DONE]");
+    sse
+}
+
 fn default_ok_sse() -> String {
     sse_from_chunks(vec![
         json!({"choices":[{"delta":{"role":"assistant","content":"OK"}}]}),
@@ -613,6 +649,17 @@ async fn spawn_mock_upstream_with_responses(
     responses: Vec<String>,
 ) -> (u16, Arc<Mutex<Vec<Value>>>) {
     spawn_mock_upstream_with_chat_handler(responses, chat_handler).await
+}
+
+async fn spawn_blocking_mock_upstream(responses: Vec<Value>) -> (u16, Arc<Mutex<Vec<Value>>>) {
+    spawn_mock_upstream_with_chat_handler(
+        responses
+            .into_iter()
+            .map(|response| response.to_string())
+            .collect(),
+        blocking_chat_handler,
+    )
+    .await
 }
 
 async fn spawn_delayed_mock_upstream() -> (u16, Arc<Mutex<Vec<Value>>>) {
@@ -997,12 +1044,11 @@ async fn issue_26_non_glm_model_does_not_send_thinking() {
 
 #[tokio::test]
 async fn issue_31_stream_without_done_still_completes_when_content_received() {
-    // Some OpenAI-compatible providers (e.g. synthetic.new) close the SSE stream
-    // cleanly without ever sending a terminating `[DONE]` line. A turn that
-    // received content should still complete rather than be discarded.
+    // A provider that closes the SSE stream without a terminating `[DONE]`
+    // line, but did send `finish_reason`, has delivered a complete turn.
     let no_done_sse = sse_from_chunks_without_done(vec![
         json!({"choices":[{"delta":{"role":"assistant","content":"Hello"}}]}),
-        json!({"choices":[{"delta":{"content":" world"}}]}),
+        json!({"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}),
         json!({"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}),
     ]);
     let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![no_done_sse]).await;
@@ -1018,12 +1064,165 @@ async fn issue_31_stream_without_done_still_completes_when_content_received() {
         .iter()
         .find_map(|(event, data)| (event == "response.completed").then_some(data));
     let failed = events.iter().any(|(event, _)| event == "response.failed");
-    assert!(!failed, "stream should not fail when content was received");
+    assert!(!failed, "stream should not fail when the turn finished");
     let completed = completed.expect("response.completed");
     assert_eq!(
         completed["response"]["output"][0]["content"][0]["text"],
         "Hello world"
     );
+}
+
+#[tokio::test]
+async fn issue_31_unterminated_done_line_is_still_recognized() {
+    // synthetic.new ends the stream with `data: [DONE]` and no trailing
+    // newline. The SSE spec discards an unterminated final event at EOF, so
+    // without an explicit flush `[DONE]` is lost and every turn falls through
+    // to the `missing_done` quirk. Usage from the final chunk must survive too.
+    let sse = sse_from_chunks_unterminated_done(vec![
+        json!({"choices":[{"delta":{"role":"assistant","content":"OK"}}]}),
+        json!({"choices":[{"delta":{},"finish_reason":"stop"}],
+               "usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}),
+    ]);
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({"model": "mock-model", "input": "Say hi.", "tools": [], "stream": true}),
+    )
+    .await;
+
+    let completed = events
+        .iter()
+        .find_map(|(event, data)| (event == "response.completed").then_some(data))
+        .expect("response.completed");
+    assert_eq!(
+        completed["response"]["output"][0]["content"][0]["text"],
+        "OK"
+    );
+    assert_eq!(completed["response"]["usage"]["total_tokens"], 7);
+}
+
+#[tokio::test]
+async fn issue_31_truncated_stream_without_finish_reason_fails() {
+    // No `[DONE]` *and* no `finish_reason`: the connection died mid-generation.
+    // Completing here would persist a half-written turn into session history.
+    let truncated = sse_from_chunks_without_done(vec![
+        json!({"choices":[{"delta":{"role":"assistant","content":"Hel"}}]}),
+    ]);
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![truncated]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({"model": "mock-model", "input": "Say hi.", "tools": [], "stream": true}),
+    )
+    .await;
+
+    assert!(
+        events.iter().any(|(event, _)| event == "response.failed"),
+        "truncated turn must not be reported as completed"
+    );
+}
+
+#[tokio::test]
+async fn think_tags_leaked_into_content_are_routed_to_reasoning() {
+    // vLLM deployments without a `--reasoning-parser` emit chain of thought as
+    // `<think>` markup inside `content`. It must reach Codex as reasoning, not
+    // as assistant text — including when a tag straddles two chunks.
+    let sse = sse_from_chunks(vec![
+        json!({"choices":[{"delta":{"role":"assistant","content":"<thi"}}]}),
+        json!({"choices":[{"delta":{"content":"nk>musing</th"}}]}),
+        json!({"choices":[{"delta":{"content":"ink>\n\nHello!"},"finish_reason":"stop"}]}),
+    ]);
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({"model": "mock-model", "input": "Say hi.", "tools": [], "stream": true}),
+    )
+    .await;
+
+    let text: String = events
+        .iter()
+        .filter(|(event, _)| event == "response.output_text.delta")
+        .filter_map(|(_, data)| data["delta"].as_str())
+        .collect();
+    let reasoning: String = events
+        .iter()
+        .filter(|(event, _)| event == "response.reasoning_summary_text.delta")
+        .filter_map(|(_, data)| data["delta"].as_str())
+        .collect();
+
+    assert_eq!(text, "Hello!", "think markup must not reach visible text");
+    assert_eq!(reasoning, "musing");
+}
+
+#[tokio::test]
+async fn blocking_think_tags_are_exposed_and_persisted_as_reasoning() {
+    let (upstream_port, bodies) = spawn_blocking_mock_upstream(vec![
+        json!({
+            "choices": [{"message": {
+                "role": "assistant",
+                "content": "<think>secret</think>answer"
+            }}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+        }),
+        json!({
+            "choices": [{"message": {"role": "assistant", "content": "next answer"}}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10}
+        }),
+    ])
+    .await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+    let client = reqwest::Client::new();
+
+    let first: Value = client
+        .post(relay.url("/v1/responses"))
+        .json(&json!({
+            "model": "mock-model",
+            "input": "first question",
+            "tools": [],
+            "stream": false
+        }))
+        .send()
+        .await
+        .expect("first blocking request")
+        .error_for_status()
+        .expect("first blocking response status")
+        .json()
+        .await
+        .expect("first blocking response json");
+    assert_eq!(first["output"][0]["type"], "reasoning");
+    assert_eq!(first["output"][0]["summary"][0]["text"], "secret");
+    assert_eq!(first["output"][1]["content"][0]["text"], "answer");
+
+    client
+        .post(relay.url("/v1/responses"))
+        .json(&json!({
+            "model": "mock-model",
+            "previous_response_id": first["id"],
+            "input": "second question",
+            "tools": [],
+            "stream": false
+        }))
+        .send()
+        .await
+        .expect("second blocking request")
+        .error_for_status()
+        .expect("second blocking response status");
+
+    let request_bodies = bodies.lock().unwrap();
+    let replayed = request_bodies[1]["messages"]
+        .as_array()
+        .expect("second request messages")
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("replayed assistant message");
+    assert_eq!(replayed["content"], "answer");
+    assert_eq!(replayed["reasoning_content"], "secret");
+    assert!(!request_bodies[1].to_string().contains("<think>"));
 }
 
 #[tokio::test]
@@ -1227,6 +1426,68 @@ async fn issue_17_streaming_namespaced_tool_calls_emit_namespace_field() {
     assert_eq!(
         request_bodies[0]["tools"][0]["function"]["name"], "mcp__node_repl-js",
         "namespace tools must be flattened with a reversible separator"
+    );
+}
+
+#[tokio::test]
+async fn issue_43_streaming_collaboration_calls_request_plaintext_arguments() {
+    let tool_sse = sse_from_chunks(vec![
+        json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_spawn",
+                        "function": {
+                            "name": "collaboration-spawn_agent",
+                            "arguments": "{\"message\":\"do the task\"}"
+                        }
+                    }]
+                }
+            }]
+        }),
+        json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}),
+    ]);
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![tool_sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({
+            "model": "mock-model",
+            "input": "Delegate the task.",
+            "tools": [{
+                "type": "namespace",
+                "name": "collaboration",
+                "tools": [{
+                    "type": "function",
+                    "name": "spawn_agent",
+                    "parameters": {"type": "object"}
+                }]
+            }],
+            "stream": true
+        }),
+    )
+    .await;
+
+    for event_name in ["response.output_item.added", "response.output_item.done"] {
+        let item = events
+            .iter()
+            .find(|(event, data)| event == event_name && data["item"]["type"] == "function_call")
+            .map(|(_, data)| &data["item"])
+            .unwrap_or_else(|| panic!("{event_name} function_call item"));
+        assert_eq!(item["namespace"], "collaboration");
+        assert_eq!(item["name"], "spawn_agent");
+        assert_eq!(item["encrypted_function_args"], json!([]));
+    }
+
+    let completed = events
+        .iter()
+        .find_map(|(event, data)| (event == "response.completed").then_some(data))
+        .expect("response.completed");
+    assert_eq!(
+        completed["response"]["output"][0]["encrypted_function_args"],
+        json!([])
     );
 }
 

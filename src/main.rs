@@ -3,6 +3,7 @@ mod dsml;
 mod quirks;
 mod session;
 mod stream;
+mod think;
 mod translate;
 mod types;
 mod upstream_request;
@@ -807,22 +808,22 @@ async fn handle_blocking(
                     "← upstream function_calls={}",
                     summarize_debug_names(chat_response_tool_call_debug_names(&chat_resp))
                 );
-                let assistant_msg = chat_resp
-                    .choices
-                    .first()
-                    .map(|c| c.message.clone())
-                    .unwrap_or_else(|| ChatMessage {
-                        role: "assistant".into(),
-                        content: Some(serde_json::Value::String(String::new())),
-                        reasoning_content: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                        name: None,
-                    });
-
-                let mut full_history = chat_req.messages.clone();
-                full_history.push(assistant_msg);
                 let response_id = state.sessions.new_id();
+                let (resp, assistant_messages) =
+                    if namespace_tools.is_empty() && custom_tools.is_empty() {
+                        translate::from_chat_response(response_id.clone(), &model, chat_resp)
+                    } else {
+                        translate::from_chat_response_with_tool_maps(
+                            response_id.clone(),
+                            &model,
+                            chat_resp,
+                            &namespace_tools,
+                            &custom_tools,
+                        )
+                    };
+
+                let mut full_history = chat_req.messages;
+                full_history.extend(assistant_messages);
                 if let Some(corpus) = &state.corpus {
                     corpus.record_turn(
                         previous_response_id.as_deref(),
@@ -831,21 +832,7 @@ async fn handle_blocking(
                         &full_history,
                     );
                 }
-                state
-                    .sessions
-                    .save_with_id(response_id.clone(), full_history);
-
-                let (resp, _) = if namespace_tools.is_empty() && custom_tools.is_empty() {
-                    translate::from_chat_response(response_id, &model, chat_resp)
-                } else {
-                    translate::from_chat_response_with_tool_maps(
-                        response_id,
-                        &model,
-                        chat_resp,
-                        &namespace_tools,
-                        &custom_tools,
-                    )
-                };
+                state.sessions.save_with_id(response_id, full_history);
                 Json(resp).into_response()
             }
         },

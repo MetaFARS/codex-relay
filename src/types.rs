@@ -208,7 +208,8 @@ pub struct ChatStreamChunk {
 #[derive(Debug, Deserialize)]
 pub struct ChatStreamChoice {
     pub delta: ChatDelta,
-    #[allow(dead_code)]
+    /// Upstream end-of-turn signal. Used by stream.rs to tell a provider that
+    /// merely omitted `[DONE]` from a connection that died mid-generation.
     pub finish_reason: Option<String>,
 }
 

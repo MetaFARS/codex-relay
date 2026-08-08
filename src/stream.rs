@@ -15,6 +15,7 @@ use crate::{
     corpus::CorpusRecorder,
     dsml::{synthesize_call_id, DsmlStreamFilter},
     session::SessionStore,
+    think::ThinkStreamFilter,
     translate::{
         custom_tool_input, response_function_name_for_responses, uses_plaintext_collaboration_args,
         CustomToolMap, NamespaceToolMap,
@@ -140,6 +141,9 @@ pub fn translate_stream(
         // and heals it into structured tool calls at end of stream.
         // Quirk `dsml_heal`, see quirks.rs.
         let mut dsml_filter = DsmlStreamFilter::new(crate::quirks::quirk_enabled("dsml_heal"));
+        // Splits leaked `<think>` markup out of text content and onto the
+        // reasoning channel. Quirk `think_tags`, see quirks.rs.
+        let mut think_filter = ThinkStreamFilter::new(crate::quirks::quirk_enabled("think_tags"));
         let mut reasoning_chunks: usize = 0;
         let mut tool_calls: BTreeMap<usize, ToolCallAccum> = BTreeMap::new();
         let mut reasoning_output_index: Option<usize> = None;
@@ -147,8 +151,27 @@ pub fn translate_stream(
         let mut next_output_index: usize = 0;
         let mut stream_done = false;
         let mut stream_err = false;
+        // The upstream's own end-of-turn signal. Distinguishes "provider closed
+        // without [DONE]" (safe to complete) from "connection died mid-turn"
+        // (must not be completed).
+        let mut finish_reason: Option<String> = None;
         let mut stream_usage: Option<ChatUsage> = None;
-        let mut source = upstream.bytes_stream().eventsource();
+        // synthetic.new terminates the stream with `\n\ndata: [DONE]` and no
+        // trailing newline. eventsource-stream follows the SSE spec and
+        // discards a pending event that was never terminated by a blank line,
+        // so `[DONE]` is silently lost and every turn falls through to the
+        // `missing_done` quirk. Appending a blank line flushes it. Against
+        // spec-compliant providers this is a no-op: a blank line with an empty
+        // data buffer dispatches no event.
+        let mut source = upstream
+            .bytes_stream()
+            .chain(futures_util::stream::once(std::future::ready(Ok::<
+                _,
+                reqwest::Error,
+            >(
+                bytes::Bytes::from_static(b"\n\n"),
+            ))))
+            .eventsource();
 
         while let Some(ev) = source.next().await {
             match ev {
@@ -171,10 +194,25 @@ pub fn translate_stream(
                                 stream_usage = usage;
                             }
                             for choice in &choices {
+                                if let Some(fr) = &choice.finish_reason {
+                                    finish_reason = Some(fr.clone());
+                                }
+                                // Split leaked `<think>` markup out of the text
+                                // content before anything else looks at it, so
+                                // thinking reaches the reasoning channel and
+                                // never enters accumulated_text or history.
+                                let think = think_filter
+                                    .push(choice.delta.content.as_deref().unwrap_or(""));
                                 // Reasoning/thinking content (kimi-k2.6, GLM, etc.).
                                 // Field name varies by provider (reasoning_content
                                 // vs reasoning) — normalized via reasoning_text().
-                                if let Some(rc) = choice.delta.reasoning_text() {
+                                {
+                                    let reasoning_delta = match choice.delta.reasoning_text() {
+                                        Some(native) if think.reasoning.is_empty() => native.to_string(),
+                                        Some(native) => format!("{native}{}", think.reasoning),
+                                        None => think.reasoning.clone(),
+                                    };
+                                    let rc = reasoning_delta.as_str();
                                     if !rc.is_empty() {
                                         reasoning_chunks += 1;
                                         let output_index = match reasoning_output_index {
@@ -211,7 +249,7 @@ pub fn translate_stream(
                                 }
 
                                 // Text content, filtered for leaked DSML markup.
-                                let content = dsml_filter.push(choice.delta.content.as_deref().unwrap_or(""));
+                                let content = dsml_filter.push(&think.text);
                                 if !content.is_empty() {
                                     let output_index = match message_output_index {
                                         Some(idx) => idx,
@@ -278,10 +316,52 @@ pub fn translate_stream(
             }
         }
 
+        // Flush the think filter first: an unterminated `<think>` block stays
+        // on the reasoning channel rather than leaking into visible text.
+        let think_fired = think_filter.fired();
+        let think_tail = think_filter.finish();
+        if think_fired {
+            warn!("quirk think_tags fired: split leaked <think> markup out of streamed text");
+        }
+        if !think_tail.reasoning.is_empty() {
+            let output_index = match reasoning_output_index {
+                Some(idx) => idx,
+                None => {
+                    let idx = next_output_index;
+                    next_output_index += 1;
+                    reasoning_output_index = Some(idx);
+                    yield Ok(Event::default()
+                        .event("response.output_item.added")
+                        .data(json!({
+                            "type": "response.output_item.added",
+                            "output_index": idx,
+                            "item": {
+                                "type": "reasoning",
+                                "id": &reasoning_item_id,
+                                "summary": [{"type": "summary_text", "text": ""}]
+                            }
+                        }).to_string()));
+                    idx
+                }
+            };
+            accumulated_reasoning.push_str(&think_tail.reasoning);
+            yield Ok(Event::default()
+                .event("response.reasoning_summary_text.delta")
+                .data(json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": &reasoning_item_id,
+                    "output_index": output_index,
+                    "summary_index": 0,
+                    "delta": &think_tail.reasoning
+                }).to_string()));
+        }
+        let think_leftover = dsml_filter.push(&think_tail.text);
+
         // Flush the DSML filter: healed tool calls join the accumulated
         // tool_calls (and are emitted as function_call/custom_tool_call items
         // below); any remaining visible text is emitted as a final delta.
-        let (dsml_leftover, dsml_calls) = dsml_filter.finish();
+        let (dsml_tail, dsml_calls) = dsml_filter.finish();
+        let dsml_leftover = format!("{think_leftover}{dsml_tail}");
         if !dsml_leftover.is_empty() {
             let output_index = match message_output_index {
                 Some(idx) => idx,
@@ -474,19 +554,23 @@ pub fn translate_stream(
             fc_items.push((output_index, done_item));
         }
 
-        // Some OpenAI-compatible providers (e.g. synthetic.new) close the SSE
-        // stream cleanly without emitting a terminating `[DONE]` line. If the
-        // stream ended without an error and we already received a full turn
-        // (text and/or tool calls), treat it as complete so the response is
-        // persisted and `response.completed` is emitted. A mid-stream error
-        // (stream_err) still discards the partial turn.
-        if !stream_done
-            && !stream_err
-            && (!accumulated_text.is_empty() || !tool_calls.is_empty())
-            && crate::quirks::quirk_enabled("missing_done")
-        {
-            warn!("quirk missing_done fired: stream ended without [DONE] but content was received — treating as complete");
-            stream_done = true;
+        // Some OpenAI-compatible providers close the SSE stream without a
+        // terminating `[DONE]` line. The upstream's own end-of-turn signal is
+        // `finish_reason`, not "we have some content": completing on content
+        // alone silently promotes a connection that died mid-generation into a
+        // successful turn, which then gets persisted to history. A mid-stream
+        // error (stream_err) still discards the partial turn.
+        if !stream_done && !stream_err && crate::quirks::quirk_enabled("missing_done") {
+            match finish_reason.as_deref() {
+                Some(reason) => {
+                    warn!("quirk missing_done fired: stream ended without [DONE] (finish_reason={reason}) — treating as complete");
+                    stream_done = true;
+                }
+                None if !accumulated_text.is_empty() || !tool_calls.is_empty() => {
+                    warn!("stream ended without [DONE] and without finish_reason — turn was truncated, discarding");
+                }
+                None => {}
+            }
         }
 
         if stream_done {

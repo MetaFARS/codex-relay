@@ -189,7 +189,10 @@ mod tests {
     use uuid::Uuid;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("codex-relay-corpus-{name}-{}", Uuid::new_v4().simple()));
+        let dir = std::env::temp_dir().join(format!(
+            "codex-relay-corpus-{name}-{}",
+            Uuid::new_v4().simple()
+        ));
         fs::create_dir_all(&dir).unwrap();
         dir
     }

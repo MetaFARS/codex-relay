@@ -33,6 +33,9 @@ pub enum ResponsesInput {
     Messages(Vec<Value>),
 }
 
+// Public compatibility type. The binary compiles this module directly but
+// does not construct content parts itself, so it appears unused there.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct ContentPart {
     #[serde(rename = "type")]

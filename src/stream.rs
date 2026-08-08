@@ -17,8 +17,9 @@ use crate::{
     session::SessionStore,
     think::ThinkStreamFilter,
     translate::{
-        custom_tool_input, response_function_name_for_responses, uses_plaintext_collaboration_args,
-        CustomToolMap, NamespaceToolMap,
+        allowed_upstream_tool_names, custom_tool_input, response_function_name_for_responses,
+        uses_plaintext_collaboration_args, validate_tool_call_entries, CustomToolMap,
+        NamespaceToolMap,
     },
     types::{ChatMessage, ChatRequest, ChatStreamChunk, ChatUsage},
     upstream_request::UpstreamRequestConfig,
@@ -114,6 +115,7 @@ pub fn translate_stream(
                 return;
             }
         };
+        let allowed_tool_names = allowed_upstream_tool_names(&chat_req.tools, &upstream_body);
 
         let upstream = match builder.json(&upstream_body).send().await {
             Ok(r) if r.status().is_success() => r,
@@ -485,6 +487,24 @@ pub fn translate_stream(
                     arguments: call.arguments,
                 });
             }
+        }
+
+        if let Err(message) = validate_tool_call_entries(
+            tool_calls.values().map(|call| (call.id.as_str(), call.name.as_str())),
+            &allowed_tool_names,
+        ) {
+            warn!("rejecting invalid upstream tool calls: {message}");
+            yield Ok(Event::default()
+                .event("response.failed")
+                .data(json!({
+                    "type": "response.failed",
+                    "response": {
+                        "id": &response_id,
+                        "status": "failed",
+                        "error": {"code": "invalid_tool_call", "message": message}
+                    }
+                }).to_string()));
+            return;
         }
 
         if let Some(output_index) = reasoning_output_index {

@@ -363,7 +363,7 @@ fn dsml_leak_blocking_response_heals_into_function_call() {
     assert_eq!(response.output[0]["type"], "message");
     assert_eq!(
         response.output[0]["content"][0]["text"],
-        "我来逐步完成这个任务。"
+        "我来逐步完成这个任务。\n"
     );
     let call = &response.output[1];
     assert_eq!(call["type"], "function_call");
@@ -375,7 +375,7 @@ fn dsml_leak_blocking_response_heals_into_function_call() {
     );
 
     // Session history must store the healed message, not the raw markup.
-    assert_eq!(history[0].text_content(), "我来逐步完成这个任务。");
+    assert_eq!(history[0].text_content(), "我来逐步完成这个任务。\n");
     assert_eq!(history[0].tool_calls.as_ref().unwrap().len(), 1);
 }
 

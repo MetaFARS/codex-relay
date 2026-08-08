@@ -19,6 +19,29 @@ pub struct CustomToolName {
 
 pub type CustomToolMap = HashMap<String, CustomToolName>;
 
+/// Reject tool declarations that collapse to the same Chat Completions name.
+/// The `namespace-name` encoding is not reversible on its own; silently
+/// overwriting one identity could route a call to the wrong namespace and, for
+/// collaboration tools, incorrectly opt it into plaintext argument handling.
+pub fn validate_unique_chat_tool_names(tools: &[Value]) -> Result<(), String> {
+    let mut names = HashSet::new();
+    for tool in convert_tools(tools) {
+        let Some(name) = tool
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if !names.insert(name.to_string()) {
+            return Err(format!(
+                "ambiguous tool name {name:?}: declared more than once"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Convert a Responses API request + prior history into a Chat Completions request.
 pub fn to_chat_request(
     req: &ResponsesRequest,
@@ -313,6 +336,7 @@ fn convert_tools(tools: &[Value]) -> Vec<Value> {
 
 pub fn namespace_tool_map(tools: &[Value]) -> NamespaceToolMap {
     let mut map = NamespaceToolMap::new();
+    let denied = tool_denylist_from_env();
     for tool in tools {
         if tool.get("type").and_then(Value::as_str) != Some("namespace") {
             continue;
@@ -327,10 +351,13 @@ pub fn namespace_tool_map(tools: &[Value]) -> NamespaceToolMap {
             if sub.get("type").and_then(Value::as_str) != Some("function") {
                 continue;
             }
-            let Some(name) = sub.get("name").and_then(Value::as_str) else {
+            let Some(name) = declared_function_name(sub) else {
                 continue;
             };
             let chat_name = chat_function_name_for_namespace_tool(namespace, name);
+            if tool_is_denied(sub, Some(&chat_name), &denied) {
+                continue;
+            }
             map.insert(
                 chat_name,
                 NamespaceToolName {
@@ -344,11 +371,15 @@ pub fn namespace_tool_map(tools: &[Value]) -> NamespaceToolMap {
 }
 
 pub fn custom_tool_map(tools: &[Value]) -> CustomToolMap {
+    let denied = tool_denylist_from_env();
     tools
         .iter()
         .filter_map(|tool| {
             let tool_type = tool.get("type").and_then(Value::as_str)?;
             let name = tool.get("name").and_then(Value::as_str)?;
+            if denied.contains(name) {
+                return None;
+            }
             let argument_field = match tool_type {
                 "custom" => custom_argument_field(name).to_string(),
                 // Codex CLI declares `apply_patch` as a plain function tool in
@@ -369,6 +400,14 @@ pub fn custom_tool_map(tools: &[Value]) -> CustomToolMap {
             ))
         })
         .collect()
+}
+
+fn declared_function_name(tool: &Value) -> Option<&str> {
+    tool.get("name").and_then(Value::as_str).or_else(|| {
+        tool.get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+    })
 }
 
 /// If a Responses API function tool takes a single string parameter, return
@@ -1452,6 +1491,78 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["spawn_agent", "wait_agent"]);
+    }
+
+    #[test]
+    fn test_rejects_flat_and_namespace_tool_name_collision() {
+        let tools = vec![
+            json!({"type": "function", "name": "collaboration-spawn_agent"}),
+            json!({
+                "type": "namespace",
+                "name": "collaboration",
+                "tools": [{"type": "function", "name": "spawn_agent"}]
+            }),
+        ];
+
+        let error = validate_unique_chat_tool_names(&tools).unwrap_err();
+        assert!(error.contains("collaboration-spawn_agent"));
+    }
+
+    #[test]
+    fn test_rejects_nested_chat_and_namespace_tool_name_collision() {
+        let tools = vec![
+            json!({
+                "type": "function",
+                "function": {"name": "collaboration-spawn_agent"}
+            }),
+            json!({
+                "type": "namespace",
+                "name": "collaboration",
+                "tools": [{"type": "function", "name": "spawn_agent"}]
+            }),
+        ];
+
+        let error = validate_unique_chat_tool_names(&tools).unwrap_err();
+        assert!(error.contains("collaboration-spawn_agent"));
+    }
+
+    #[test]
+    fn test_rejects_namespace_tool_name_collision() {
+        let tools = vec![
+            json!({
+                "type": "namespace",
+                "name": "a",
+                "tools": [{"type": "function", "name": "b-c"}]
+            }),
+            json!({
+                "type": "namespace",
+                "name": "a-b",
+                "tools": [{"type": "function", "name": "c"}]
+            }),
+        ];
+
+        let error = validate_unique_chat_tool_names(&tools).unwrap_err();
+        assert!(error.contains("a-b-c"));
+    }
+
+    #[test]
+    fn test_denylisted_collision_is_removed_from_tools_and_reverse_map() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tools = vec![
+            json!({"type": "function", "name": "collaboration-spawn_agent"}),
+            json!({
+                "type": "namespace",
+                "name": "collaboration",
+                "tools": [{"type": "function", "name": "spawn_agent"}]
+            }),
+        ];
+        std::env::set_var("CODEX_RELAY_TOOL_DENYLIST", "collaboration-spawn_agent");
+
+        assert!(validate_unique_chat_tool_names(&tools).is_ok());
+        assert!(convert_tools(&tools).is_empty());
+        assert!(namespace_tool_map(&tools).is_empty());
+
+        std::env::remove_var("CODEX_RELAY_TOOL_DENYLIST");
     }
 
     #[test]

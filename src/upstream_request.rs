@@ -95,6 +95,7 @@ mod tests {
             max_tokens: Some(100),
             stream_options: None,
             thinking: None,
+            reasoning_effort: None,
             stream: false,
         }
     }

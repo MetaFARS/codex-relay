@@ -957,6 +957,7 @@ mod tests {
             max_output_tokens: None,
             system: None,
             instructions: None,
+            reasoning: None,
         };
         let history = vec![ChatMessage {
             role: "assistant".into(),
@@ -989,6 +990,7 @@ mod tests {
             max_output_tokens: None,
             system: None,
             instructions: None,
+            reasoning: None,
         };
         let history = vec![ChatMessage {
             role: "assistant".into(),
@@ -1021,6 +1023,7 @@ mod tests {
             max_output_tokens: None,
             system: None,
             instructions: None,
+            reasoning: None,
         };
         let history = vec![ChatMessage {
             role: "assistant".into(),
@@ -1067,6 +1070,7 @@ mod tests {
             max_output_tokens: None,
             system: None,
             instructions: None,
+            reasoning: None,
         };
         let history = vec![ChatMessage {
             role: "assistant".into(),
@@ -1099,6 +1103,7 @@ mod tests {
             max_output_tokens: None,
             system: None,
             instructions: None,
+            reasoning: None,
         };
         let history = vec![
             ChatMessage {

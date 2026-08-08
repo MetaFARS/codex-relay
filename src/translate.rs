@@ -606,6 +606,9 @@ pub fn from_chat_response_with_tool_maps(
                     "status": "completed"
                 });
                 if let Some(namespace) = namespace {
+                    if uses_plaintext_collaboration_args(Some(&namespace), &name) {
+                        item["encrypted_function_args"] = json!([]);
+                    }
                     item["namespace"] = Value::String(namespace);
                 }
                 item
@@ -642,6 +645,11 @@ pub(crate) fn response_function_name_for_responses(
     split_mcp_function_name(name)
 }
 
+pub(crate) fn uses_plaintext_collaboration_args(namespace: Option<&str>, name: &str) -> bool {
+    namespace == Some("collaboration")
+        && matches!(name, "spawn_agent" | "send_message" | "followup_task")
+}
+
 pub(crate) fn split_mcp_function_name(name: &str) -> (Option<String>, String) {
     if let Some((namespace, child)) = name.split_once('.') {
         if !namespace.is_empty() && !child.is_empty() {
@@ -674,8 +682,6 @@ pub(crate) fn split_mcp_function_name(name: &str) -> (Option<String>, String) {
 /// - Parts array with any non-text part (e.g. `input_image`) → kept as a
 ///   `Value::Array` of multimodal Chat Completions parts:
 ///     * `input_text` / `text`  → `{type:"text", text}`
-///     * `encrypted_content`    → `{type:"text", text}` (codex subagent
-///       task payload — plaintext despite the name; see `part_text`)
 ///     * `input_image` (string) → `{type:"image_url", image_url:{url}}`
 ///     * `image_url`            → normalized to `{type:"image_url", image_url:{url}}`
 ///
@@ -690,15 +696,12 @@ fn value_to_chat_content(v: Option<&Value>) -> Option<Value> {
             // treat it the same as text for the purposes of collapsing.
             let has_non_text = parts.iter().any(|p| {
                 let kind = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                !matches!(
-                    kind,
-                    "input_text" | "text" | "output_text" | "encrypted_content"
-                )
+                !matches!(kind, "input_text" | "text" | "output_text")
             });
             if !has_non_text {
                 let s: String = parts
                     .iter()
-                    .filter_map(part_text)
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
                     .collect::<Vec<_>>()
                     .join("");
                 Some(Value::String(s))
@@ -711,25 +714,12 @@ fn value_to_chat_content(v: Option<&Value>) -> Option<Value> {
     }
 }
 
-/// Extract the plain-text payload of a text-like content part.
-///
-/// Codex multi-agent subagent threads carry the task payload in an
-/// `encrypted_content` part (the value is plaintext despite the name); it
-/// must be rewritten to text, never dropped, or the subagent's first turn
-/// loses its instructions and the upstream 400s on the unknown part type.
-fn part_text(part: &Value) -> Option<&str> {
-    match part.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-        "encrypted_content" => part.get("encrypted_content").and_then(|t| t.as_str()),
-        _ => part.get("text").and_then(|t| t.as_str()),
-    }
-}
-
 /// Reshape a single Responses-API content part into a Chat Completions one.
 fn map_content_part(part: &Value) -> Value {
     let kind = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match kind {
-        "input_text" | "text" | "output_text" | "encrypted_content" => {
-            let text = part_text(part).unwrap_or("");
+        "input_text" | "text" | "output_text" => {
+            let text = part.get("text").and_then(|t| t.as_str()).unwrap_or("");
             json!({"type": "text", "text": text})
         }
         "input_image" => {
@@ -906,6 +896,62 @@ mod tests {
         assert_eq!(resp.output[0]["namespace"], "mcp__node_repl");
         assert_eq!(resp.output[0]["name"], "status");
         assert_eq!(resp.output[0]["call_id"], "call_status");
+    }
+
+    #[test]
+    fn test_collaboration_calls_request_plaintext_arguments() {
+        let call_names = [
+            "collaboration-spawn_agent",
+            "collaboration-send_message",
+            "collaboration-followup_task",
+            "collaboration-wait",
+            "unrelated",
+        ];
+        let chat = ChatResponse {
+            choices: vec![ChatChoice {
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(
+                        call_names
+                            .iter()
+                            .enumerate()
+                            .map(|(index, name)| {
+                                json!({
+                                    "id": format!("call_{index}"),
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": "{}"}
+                                })
+                            })
+                            .collect(),
+                    ),
+                    tool_call_id: None,
+                    name: None,
+                },
+            }],
+            usage: None,
+        };
+        let tools = vec![json!({
+            "type": "namespace",
+            "name": "collaboration",
+            "tools": [
+                {"type": "function", "name": "spawn_agent"},
+                {"type": "function", "name": "send_message"},
+                {"type": "function", "name": "followup_task"},
+                {"type": "function", "name": "wait"}
+            ]
+        })];
+        let namespace_tools = namespace_tool_map(&tools);
+
+        let (resp, _) =
+            from_chat_response_with_tool_map("resp_1".into(), "test-model", chat, &namespace_tools);
+        for item in &resp.output[..3] {
+            assert_eq!(item["namespace"], "collaboration");
+            assert_eq!(item["encrypted_function_args"], json!([]));
+        }
+        assert!(resp.output[3].get("encrypted_function_args").is_none());
+        assert!(resp.output[4].get("encrypted_function_args").is_none());
     }
 
     #[test]
@@ -1171,43 +1217,19 @@ mod tests {
         assert_eq!(chat.messages[0].text_content(), "hi");
     }
 
-    /// Codex subagent threads send the task payload as an
-    /// `encrypted_content` part (plaintext despite the name). It must be
-    /// rewritten to text — dropping it kills the subagent's first turn,
-    /// and forwarding it verbatim gets a 400 from upstreams like Moonshot.
     #[test]
-    fn test_encrypted_content_part_rewritten_to_text() {
+    fn test_agent_message_plaintext_input_reaches_chat_upstream() {
         let sessions = SessionStore::new();
-        let req = base_req(ResponsesInput::Messages(vec![
-            // exact shape codex multi-agent subagent threads send on turn 1
-            json!({"type": "agent_message", "role": "assistant", "content": [
-                {"type": "encrypted_content", "encrypted_content": "do the task"}
-            ]}),
-        ]));
+        let req = base_req(ResponsesInput::Messages(vec![json!({
+        "type": "agent_message",
+        "author": "agent-a",
+        "recipient": "agent-b",
+        "content": [
+            {"type": "input_text", "text": "do the task"}
+        ]})]));
         let chat = to_chat_request(&req, vec![], &sessions);
         assert!(chat.messages[0].content.as_ref().unwrap().is_string());
         assert_eq!(chat.messages[0].text_content(), "do the task");
-    }
-
-    /// encrypted_content mixed with a non-text part must map to a text
-    /// part in the multimodal array, never pass through unchanged.
-    #[test]
-    fn test_encrypted_content_in_multimodal_array() {
-        let sessions = SessionStore::new();
-        let req = base_req(ResponsesInput::Messages(vec![
-            json!({"type": "message", "role": "user", "content": [
-                {"type": "encrypted_content", "encrypted_content": "payload"},
-                {"type": "input_image", "image_url": "data:image/png;base64,AAA"}
-            ]}),
-        ]));
-        let chat = to_chat_request(&req, vec![], &sessions);
-        let parts = chat.messages[0]
-            .content
-            .as_ref()
-            .and_then(|v| v.as_array())
-            .expect("multimodal content");
-        assert_eq!(parts[0]["type"], "text");
-        assert_eq!(parts[0]["text"], "payload");
     }
 
     #[test]

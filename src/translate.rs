@@ -412,6 +412,51 @@ pub fn custom_tool_map(tools: &[Value]) -> CustomToolMap {
         .collect()
 }
 
+pub(crate) fn chat_tool_names(tools: &[Value]) -> HashSet<String> {
+    tools
+        .iter()
+        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+        .filter_map(|tool| {
+            tool.get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
+        .collect()
+}
+
+pub(crate) fn allowed_upstream_tool_names(
+    declared_tools: &[Value],
+    upstream_body: &Value,
+) -> HashSet<String> {
+    let declared = chat_tool_names(declared_tools);
+    let actual = upstream_body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| chat_tool_names(tools))
+        .unwrap_or_default();
+    declared.intersection(&actual).cloned().collect()
+}
+
+pub(crate) fn validate_tool_call_entries<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a str)>,
+    allowed_names: &HashSet<String>,
+) -> Result<(), &'static str> {
+    let mut call_ids = HashSet::new();
+    for (call_id, name) in entries {
+        if call_id.is_empty() {
+            return Err("upstream returned an empty tool call ID");
+        }
+        if !call_ids.insert(call_id) {
+            return Err("upstream returned duplicate tool call IDs");
+        }
+        if name.is_empty() || !allowed_names.contains(name) {
+            return Err("upstream returned an undeclared tool call");
+        }
+    }
+    Ok(())
+}
+
 fn declared_function_name(tool: &Value) -> Option<&str> {
     tool.get("name").and_then(Value::as_str).or_else(|| {
         tool.get("function")
@@ -745,35 +790,12 @@ pub(crate) fn response_function_name_for_responses(
     if let Some(tool_name) = namespace_tools.get(name) {
         return (Some(tool_name.namespace.clone()), tool_name.name.clone());
     }
-    split_mcp_function_name(name)
+    (None, name.to_string())
 }
 
 pub(crate) fn uses_plaintext_collaboration_args(namespace: Option<&str>, name: &str) -> bool {
     namespace == Some("collaboration")
         && matches!(name, "spawn_agent" | "send_message" | "followup_task")
-}
-
-pub(crate) fn split_mcp_function_name(name: &str) -> (Option<String>, String) {
-    if let Some((namespace, child)) = name.split_once('.') {
-        if !namespace.is_empty() && !child.is_empty() {
-            return (Some(namespace.to_string()), child.to_string());
-        }
-    }
-
-    let Some(rest) = name.strip_prefix("mcp__") else {
-        return (None, name.to_string());
-    };
-    let Some(server_end) = rest.find("__") else {
-        return (None, name.to_string());
-    };
-    let split_at = "mcp__".len() + server_end + "__".len();
-    if split_at >= name.len() {
-        return (None, name.to_string());
-    }
-    (
-        Some(name[..split_at].to_string()),
-        name[split_at..].to_string(),
-    )
 }
 
 /// True when a user/system message would reach the upstream carrying nothing.
@@ -1518,7 +1540,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_chat_response_keeps_legacy_dot_namespace_split() {
+    fn test_unmapped_dot_name_is_not_promoted_to_namespace() {
         let chat = ChatResponse {
             choices: vec![ChatChoice {
                 message: ChatMessage {
@@ -1541,8 +1563,9 @@ mod tests {
         };
 
         let (resp, _) = from_chat_response("resp_1".into(), "test-model", chat);
-        assert_eq!(resp.output[0]["namespace"], "mcp__node_repl");
-        assert_eq!(resp.output[0]["name"], "status");
+        assert!(resp.output[0].get("namespace").is_none());
+        assert!(resp.output[0].get("encrypted_function_args").is_none());
+        assert_eq!(resp.output[0]["name"], "mcp__node_repl.status");
     }
 
     #[test]
@@ -1710,6 +1733,50 @@ mod tests {
             .collect();
 
         assert_eq!(names, ["exec_command", "mcp__server-allowed"]);
+    }
+
+    #[test]
+    fn test_tool_call_validation_rejects_undeclared_duplicate_and_empty_ids() {
+        let allowed = HashSet::from(["allowed".to_string()]);
+        assert_eq!(
+            validate_tool_call_entries([("call_1", "undeclared")], &allowed),
+            Err("upstream returned an undeclared tool call")
+        );
+        assert_eq!(
+            validate_tool_call_entries([("", "allowed")], &allowed),
+            Err("upstream returned an empty tool call ID")
+        );
+        assert_eq!(
+            validate_tool_call_entries([("call_1", "allowed"), ("call_1", "allowed")], &allowed),
+            Err("upstream returned duplicate tool call IDs")
+        );
+        assert!(validate_tool_call_entries(
+            [("call_1", "allowed"), ("call_2", "allowed")],
+            &allowed
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_allowed_tools_intersect_declared_and_final_upstream_body() {
+        let declared = vec![
+            json!({"type": "function", "function": {"name": "kept"}}),
+            json!({"type": "function", "function": {"name": "removed"}}),
+        ];
+        let upstream_body = json!({
+            "tools": [
+                {"type": "function", "function": {"name": "kept"}},
+                {"type": "function", "function": {"name": "injected"}},
+                {"type": "web_search", "function": {"name": "removed"}},
+                {"function": {"name": "removed"}}
+            ]
+        });
+
+        assert_eq!(
+            allowed_upstream_tool_names(&declared, &upstream_body),
+            HashSet::from(["kept".to_string()])
+        );
+        assert!(allowed_upstream_tool_names(&declared, &json!({})).is_empty());
     }
 
     #[test]

@@ -1253,6 +1253,153 @@ async fn issue_46_blocking_embedded_error_is_not_persisted_as_success() {
 }
 
 #[tokio::test]
+async fn composed_blocking_undeclared_tool_cannot_gain_collaboration_namespace() {
+    let (upstream_port, _bodies) = spawn_blocking_mock_upstream(vec![json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_escape",
+                    "type": "function",
+                    "function": {
+                        "name": "collaboration.spawn_agent",
+                        "arguments": "{\"task_name\":\"escape\",\"message\":\"read parent\"}"
+                    }
+                }]
+            }
+        }]
+    })])
+    .await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let response = reqwest::Client::new()
+        .post(relay.url("/v1/responses"))
+        .json(&json!({
+            "model": "mock-model",
+            "input": "hello",
+            "tools": [],
+            "stream": false
+        }))
+        .send()
+        .await
+        .expect("relay response");
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response.text().await.unwrap(),
+        "upstream returned an undeclared tool call"
+    );
+}
+
+#[tokio::test]
+async fn composed_blocking_tool_dropped_from_wire_request_is_not_allowed() {
+    let (upstream_port, bodies) = spawn_blocking_mock_upstream(vec![json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_shell",
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": "{}"}
+                }]
+            }
+        }]
+    })])
+    .await;
+    let relay = Relay::spawn_with_env(
+        &format!("http://127.0.0.1:{upstream_port}/v1"),
+        &[("CODEX_RELAY_DROP_PARAMS", "[\"tools\"]")],
+    );
+
+    let response = reqwest::Client::new()
+        .post(relay.url("/v1/responses"))
+        .json(&json!({
+            "model": "mock-model",
+            "input": "hello",
+            "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .expect("relay response");
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    assert!(bodies.lock().unwrap()[0].get("tools").is_none());
+}
+
+#[tokio::test]
+async fn composed_streaming_duplicate_tool_ids_fail_before_tool_completion() {
+    let sse = sse_from_chunks(vec![json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [
+                    {"index": 0, "id": "duplicate", "function": {"name": "shell", "arguments": "{}"}},
+                    {"index": 1, "id": "duplicate", "function": {"name": "shell", "arguments": "{}"}}
+                ]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    })]);
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({
+            "model": "mock-model",
+            "input": "act",
+            "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            "stream": true
+        }),
+    )
+    .await;
+
+    assert!(events.iter().any(|(event, data)| {
+        event == "response.failed" && data["response"]["error"]["code"] == "invalid_tool_call"
+    }));
+    assert!(events
+        .iter()
+        .all(|(event, _)| event != "response.output_item.done"));
+    assert!(events
+        .iter()
+        .all(|(event, _)| event != "response.completed"));
+}
+
+#[tokio::test]
+async fn composed_streaming_dsml_cannot_call_an_undeclared_tool() {
+    let dsml = concat!(
+        "<｜DSML｜tool_calls>",
+        "<｜DSML｜invoke name=\"shell\">",
+        "<｜DSML｜parameter name=\"command\" string=\"true\">id</｜DSML｜parameter>",
+        "</｜DSML｜invoke>",
+        "</｜DSML｜tool_calls>"
+    );
+    let sse = sse_from_chunks(vec![json!({
+        "choices": [{"delta": {"content": dsml}, "finish_reason": "stop"}]
+    })]);
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({"model": "mock-model", "input": "hello", "tools": [], "stream": true}),
+    )
+    .await;
+
+    assert!(events.iter().any(|(event, data)| {
+        event == "response.failed" && data["response"]["error"]["code"] == "invalid_tool_call"
+    }));
+    assert!(events
+        .iter()
+        .all(|(event, _)| event != "response.output_item.done"));
+    assert!(events
+        .iter()
+        .all(|(event, _)| event != "response.completed"));
+}
+
+#[tokio::test]
 async fn think_tags_leaked_into_content_are_routed_to_reasoning() {
     // vLLM deployments without a `--reasoning-parser` emit chain of thought as
     // `<think>` markup inside `content`. It must reach Codex as reasoning, not

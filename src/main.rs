@@ -676,6 +676,14 @@ fn should_isolate_spawn_child_request(req: &ResponsesRequest, history: &[ChatMes
     let Some(input) = isolated_child_input(&req.input) else {
         return false;
     };
+    let mut call_id_counts = std::collections::HashMap::new();
+    for call_id in history
+        .iter()
+        .flat_map(|msg| msg.tool_calls.as_deref().unwrap_or(&[]))
+        .filter_map(|call| call.get("id").and_then(serde_json::Value::as_str))
+    {
+        *call_id_counts.entry(call_id).or_insert(0usize) += 1;
+    }
     let completed_tool_calls: std::collections::HashSet<&str> = history
         .iter()
         .filter_map(|msg| msg.tool_call_id.as_deref())
@@ -685,7 +693,11 @@ fn should_isolate_spawn_child_request(req: &ResponsesRequest, history: &[ChatMes
         .flat_map(|msg| msg.tool_calls.as_deref().unwrap_or(&[]))
         .filter(|call| {
             let call_id = call.get("id").and_then(serde_json::Value::as_str);
-            call_id.is_none_or(|id| !completed_tool_calls.contains(id))
+            call_id.is_none_or(|id| {
+                id.is_empty()
+                    || call_id_counts.get(id) != Some(&1)
+                    || !completed_tool_calls.contains(id)
+            })
         })
         .filter_map(parse_spawn_agent_call)
         .collect::<Vec<_>>();
@@ -901,6 +913,8 @@ async fn handle_blocking(
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     };
+    let allowed_tool_names =
+        translate::allowed_upstream_tool_names(&chat_req.tools, &upstream_body);
 
     match builder.json(&upstream_body).send().await {
         Err(e) => {
@@ -958,6 +972,28 @@ async fn handle_blocking(
                                 &custom_tools,
                             )
                         };
+                    let tool_call_entries = assistant_messages
+                        .iter()
+                        .flat_map(|message| message.tool_calls.as_deref().unwrap_or(&[]))
+                        .map(|call| {
+                            let call_id = call
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("");
+                            let name = call
+                                .get("function")
+                                .and_then(|function| function.get("name"))
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("");
+                            (call_id, name)
+                        });
+                    if let Err(message) = translate::validate_tool_call_entries(
+                        tool_call_entries,
+                        &allowed_tool_names,
+                    ) {
+                        warn!("rejecting invalid upstream tool calls: {message}");
+                        return (StatusCode::BAD_GATEWAY, message).into_response();
+                    }
 
                     for assistant in &assistant_messages {
                         if let Some(reasoning) = assistant
@@ -1406,6 +1442,63 @@ mod tests {
         ];
 
         assert!(!should_isolate_spawn_child_request(&req, &history));
+    }
+
+    #[test]
+    fn test_duplicate_spawn_call_ids_cannot_disable_child_isolation() {
+        let req = ResponsesRequest {
+            model: "test".into(),
+            input: ResponsesInput::Messages(vec![json!({
+                "type": "agent_message",
+                "recipient": "/root/worker-b",
+                "content": [{"type": "input_text", "text": "task B"}]
+            })]),
+            previous_response_id: Some("resp_parent".into()),
+            tools: vec![],
+            stream: false,
+            temperature: None,
+            max_output_tokens: None,
+            system: None,
+            instructions: None,
+            reasoning: None,
+        };
+        let history = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![
+                    json!({
+                        "id": "duplicate",
+                        "type": "function",
+                        "function": {
+                            "name": "collaboration-spawn_agent",
+                            "arguments": "{\"task_name\":\"worker-a\",\"message\":\"task A\"}"
+                        }
+                    }),
+                    json!({
+                        "id": "duplicate",
+                        "type": "function",
+                        "function": {
+                            "name": "collaboration-spawn_agent",
+                            "arguments": "{\"task_name\":\"worker-b\",\"message\":\"task B\"}"
+                        }
+                    }),
+                ]),
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some(serde_json::Value::String("spawned worker-a".into())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: Some("duplicate".into()),
+                name: None,
+            },
+        ];
+
+        assert!(should_isolate_spawn_child_request(&req, &history));
     }
 
     #[test]

@@ -150,7 +150,8 @@ pub fn translate_stream(
         let mut message_output_index: Option<usize> = None;
         let mut next_output_index: usize = 0;
         let mut stream_done = false;
-        let mut stream_err = false;
+        let mut stream_failure: Option<(&'static str, String)> = None;
+        let mut terminal_choice_seen = false;
         // The upstream's own end-of-turn signal. Distinguishes "provider closed
         // without [DONE]" (safe to complete) from "connection died mid-turn"
         // (must not be completed).
@@ -173,11 +174,11 @@ pub fn translate_stream(
             ))))
             .eventsource();
 
-        while let Some(ev) = source.next().await {
+        'events: while let Some(ev) = source.next().await {
             match ev {
                 Err(e) => {
                     warn!("SSE parse error: {e}");
-                    stream_err = true;
+                    stream_failure = Some(("stream_parse_error", e.to_string()));
                     break;
                 }
                 Ok(ev) if ev.data.trim() == "[DONE]" => {
@@ -186,23 +187,64 @@ pub fn translate_stream(
                 }
                 Ok(ev) if ev.data.is_empty() => continue,
                 Ok(ev) => {
-                    match serde_json::from_str::<ChatStreamChunk>(&ev.data) {
-                        Err(e) => warn!("chunk parse error: {e} — data: {}", ev.data),
+                    let value = match serde_json::from_str::<Value>(&ev.data) {
+                        Ok(value) => value,
+                        Err(e) => {
+                            let message = e.to_string();
+                            warn!("upstream SSE chunk rejected: {message}");
+                            stream_failure = Some(("invalid_stream_chunk", message));
+                            break 'events;
+                        }
+                    };
+                    if let Some(error) = value.get("error") {
+                        let message = error
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .or_else(|| error.as_str())
+                            .unwrap_or("upstream stream error")
+                            .to_string();
+                        warn!("upstream SSE returned an error: {message}");
+                        stream_failure = Some(("upstream_stream_error", message));
+                        break 'events;
+                    }
+                    match serde_json::from_value::<ChatStreamChunk>(value) {
+                        Err(e) => {
+                            let message = e.to_string();
+                            warn!("upstream SSE chunk rejected: {message}");
+                            stream_failure = Some(("invalid_stream_chunk", message));
+                            break 'events;
+                        }
                         Ok(chunk) => {
                             let ChatStreamChunk { choices, usage } = chunk;
                             if usage.is_some() {
                                 stream_usage = usage;
                             }
+                            if !choices.is_empty()
+                                && (terminal_choice_seen
+                                    || choices.len() != 1
+                                    || choices[0].index != 0)
+                            {
+                                let message = if terminal_choice_seen {
+                                    "upstream sent choice data after finish_reason"
+                                } else {
+                                    "codex-relay supports only choice index 0"
+                                };
+                                stream_failure =
+                                    Some(("unsupported_stream_choices", message.to_string()));
+                                break 'events;
+                            }
                             for choice in &choices {
                                 if let Some(fr) = &choice.finish_reason {
                                     finish_reason = Some(fr.clone());
+                                    terminal_choice_seen = true;
                                 }
-                                // Split leaked `<think>` markup out of the text
-                                // content before anything else looks at it, so
-                                // thinking reaches the reasoning channel and
-                                // never enters accumulated_text or history.
-                                let think = think_filter
+                                // DSML parameters may legitimately contain
+                                // `<think>` text as part of a tool argument, so
+                                // isolate DSML before healing visible reasoning.
+                                // This matches the blocking translation order.
+                                let dsml_content = dsml_filter
                                     .push(choice.delta.content.as_deref().unwrap_or(""));
+                                let think = think_filter.push(&dsml_content);
                                 // Reasoning/thinking content (kimi-k2.6, GLM, etc.).
                                 // Field name varies by provider (reasoning_content
                                 // vs reasoning) — normalized via reasoning_text().
@@ -248,8 +290,8 @@ pub fn translate_stream(
                                     }
                                 }
 
-                                // Text content, filtered for leaked DSML markup.
-                                let content = dsml_filter.push(&think.text);
+                                // Visible text after DSML and think healing.
+                                let content = think.text;
                                 if !content.is_empty() {
                                     let output_index = match message_output_index {
                                         Some(idx) => idx,
@@ -316,10 +358,52 @@ pub fn translate_stream(
             }
         }
 
-        // Flush the think filter first: an unterminated `<think>` block stays
-        // on the reasoning channel rather than leaking into visible text.
+        // Decide the terminal state before flushing filters or marking any
+        // output item completed. Partial deltas may already have reached the
+        // client, but a truncated or malformed stream must never authorize a
+        // tool execution through `response.output_item.done`.
+        if !stream_done && stream_failure.is_none() && crate::quirks::quirk_enabled("missing_done") {
+            match finish_reason.as_deref() {
+                Some(reason) => {
+                    warn!("quirk missing_done fired: stream ended without [DONE] (finish_reason={reason}) — treating as complete");
+                    stream_done = true;
+                }
+                None if !accumulated_text.is_empty() || !tool_calls.is_empty() => {
+                    warn!("stream ended without [DONE] and without finish_reason — turn was truncated, discarding");
+                }
+                None => {}
+            }
+        }
+
+        if !stream_done {
+            let (code, message) = stream_failure.unwrap_or((
+                "stream_incomplete",
+                "stream disconnected before completion".to_string(),
+            ));
+            warn!("upstream stream failed before completion: {message}");
+            yield Ok(Event::default()
+                .event("response.failed")
+                .data(json!({
+                    "type": "response.failed",
+                    "response": {
+                        "id": &response_id,
+                        "status": "failed",
+                        "error": {"code": code, "message": message}
+                    }
+                }).to_string()));
+            return;
+        }
+
+        // Flush DSML before think healing, matching the per-delta and blocking
+        // order. Think-like text inside tool arguments remains untouched.
+        let (dsml_tail, dsml_calls) = dsml_filter.finish();
+        let mut think_tail = think_filter.push(&dsml_tail);
         let think_fired = think_filter.fired();
-        let think_tail = think_filter.finish();
+        let final_think_tail = think_filter.finish();
+        think_tail
+            .reasoning
+            .push_str(&final_think_tail.reasoning);
+        think_tail.text.push_str(&final_think_tail.text);
         if think_fired {
             warn!("quirk think_tags fired: split leaked <think> markup out of streamed text");
         }
@@ -355,14 +439,7 @@ pub fn translate_stream(
                     "delta": &think_tail.reasoning
                 }).to_string()));
         }
-        let think_leftover = dsml_filter.push(&think_tail.text);
-
-        // Flush the DSML filter: healed tool calls join the accumulated
-        // tool_calls (and are emitted as function_call/custom_tool_call items
-        // below); any remaining visible text is emitted as a final delta.
-        let (dsml_tail, dsml_calls) = dsml_filter.finish();
-        let dsml_leftover = format!("{think_leftover}{dsml_tail}");
-        if !dsml_leftover.is_empty() {
+        if !think_tail.text.is_empty() {
             let output_index = match message_output_index {
                 Some(idx) => idx,
                 None => {
@@ -385,14 +462,14 @@ pub fn translate_stream(
                     idx
                 }
             };
-            accumulated_text.push_str(&dsml_leftover);
+            accumulated_text.push_str(&think_tail.text);
             yield Ok(Event::default()
                 .event("response.output_text.delta")
                 .data(json!({
                     "type": "response.output_text.delta",
                     "item_id": &msg_item_id,
                     "output_index": output_index,
-                    "delta": &dsml_leftover
+                    "delta": &think_tail.text
                 }).to_string()));
         }
         if !dsml_calls.is_empty() {
@@ -552,25 +629,6 @@ pub fn translate_stream(
                 }).to_string()));
 
             fc_items.push((output_index, done_item));
-        }
-
-        // Some OpenAI-compatible providers close the SSE stream without a
-        // terminating `[DONE]` line. The upstream's own end-of-turn signal is
-        // `finish_reason`, not "we have some content": completing on content
-        // alone silently promotes a connection that died mid-generation into a
-        // successful turn, which then gets persisted to history. A mid-stream
-        // error (stream_err) still discards the partial turn.
-        if !stream_done && !stream_err && crate::quirks::quirk_enabled("missing_done") {
-            match finish_reason.as_deref() {
-                Some(reason) => {
-                    warn!("quirk missing_done fired: stream ended without [DONE] (finish_reason={reason}) — treating as complete");
-                    stream_done = true;
-                }
-                None if !accumulated_text.is_empty() || !tool_calls.is_empty() => {
-                    warn!("stream ended without [DONE] and without finish_reason — turn was truncated, discarding");
-                }
-                None => {}
-            }
         }
 
         if stream_done {

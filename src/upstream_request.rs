@@ -41,6 +41,12 @@ impl UpstreamRequestConfig {
         for (key, value) in &self.extra_params {
             object.insert(key.clone(), value.clone());
         }
+        if object
+            .get("n")
+            .is_some_and(|value| value.as_u64() != Some(1))
+        {
+            bail!("codex-relay supports only one upstream completion (n=1)");
+        }
 
         Ok(body)
     }
@@ -119,6 +125,13 @@ mod tests {
     #[test]
     fn rejects_non_object_extra_params() {
         assert!(UpstreamRequestConfig::from_raw(Some(r#"["thinking"]"#), None).is_err());
+    }
+
+    #[test]
+    fn rejects_multiple_upstream_completions() {
+        let config = UpstreamRequestConfig::from_raw(Some(r#"{"n":2}"#), None).unwrap();
+        let error = config.request_body(&chat_request()).unwrap_err();
+        assert!(error.to_string().contains("n=1"));
     }
 
     #[test]

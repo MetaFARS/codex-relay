@@ -1263,6 +1263,7 @@ mod tests {
 
     #[test]
     fn test_from_chat_response_uses_request_tool_map_for_namespace() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let chat = ChatResponse {
             choices: vec![ChatChoice {
                 message: ChatMessage {
@@ -1301,6 +1302,7 @@ mod tests {
 
     #[test]
     fn test_collaboration_calls_request_plaintext_arguments() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let call_names = [
             "collaboration-spawn_agent",
             "collaboration-send_message",

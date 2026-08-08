@@ -37,6 +37,17 @@ fn assistant_msg(content: &str) -> ChatMessage {
     }
 }
 
+fn user_msg(content: &str) -> ChatMessage {
+    ChatMessage {
+        role: "user".into(),
+        content: Some(content.into()),
+        reasoning_content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    }
+}
+
 fn assistant_msg_with_tool_calls(content: &str, tool_calls: Vec<serde_json::Value>) -> ChatMessage {
     ChatMessage {
         role: "assistant".into(),
@@ -57,7 +68,7 @@ fn test_deepseek_v4_pro_reasoning_roundtrip_text_only() {
     // Simulate turn 1: model returned text + reasoning
     let assistant = assistant_msg("Let me analyze this");
     store.store_turn_reasoning(
-        &[],
+        &[user_msg("Research task prompt")],
         &assistant,
         "<think>analyzing the problem...</think>".into(),
     );
@@ -101,7 +112,11 @@ fn test_deepseek_v4_pro_reasoning_roundtrip_with_tool_calls() {
             "function": {"name": "exec_command", "arguments": "{\"cmd\": \"ls\"}"}
         })],
     );
-    store.store_turn_reasoning(&[], &assistant, "<think>need to read files</think>".into());
+    store.store_turn_reasoning(
+        &[user_msg("Prompt")],
+        &assistant,
+        "<think>need to read files</think>".into(),
+    );
 
     // Turn 2: Codex replays conversation with separate items
     let req = base_req(ResponsesInput::Messages(vec![
@@ -149,7 +164,7 @@ fn test_deepseek_v4_pro_multi_turn_reasoning() {
     // Store reasoning for turn 1
     let assistant1 = assistant_msg("Step 1 analysis");
     store.store_turn_reasoning(
-        &[],
+        &[user_msg("Start research")],
         &assistant1,
         "<think>first pass thinking</think>".into(),
     );
@@ -157,7 +172,11 @@ fn test_deepseek_v4_pro_multi_turn_reasoning() {
     // Store reasoning for turn 2
     let assistant2 = assistant_msg("Step 2 deeper look");
     store.store_turn_reasoning(
-        &[],
+        &[
+            user_msg("Start research"),
+            assistant1.clone(),
+            user_msg("Go deeper"),
+        ],
         &assistant2,
         "<think>second pass thinking</think>".into(),
     );

@@ -915,44 +915,76 @@ async fn handle_blocking(
             )
                 .into_response()
         }
-        Ok(r) => match r.json::<ChatResponse>().await {
-            Err(e) => {
-                error!("parse error: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-            }
-            Ok(chat_resp) => {
-                debug!(
-                    "← upstream function_calls={}",
-                    summarize_debug_names(chat_response_tool_call_debug_names(&chat_resp))
-                );
-                let response_id = state.sessions.new_id();
-                let (resp, assistant_messages) =
-                    if namespace_tools.is_empty() && custom_tools.is_empty() {
-                        translate::from_chat_response(response_id.clone(), &model, chat_resp)
-                    } else {
-                        translate::from_chat_response_with_tool_maps(
-                            response_id.clone(),
-                            &model,
-                            chat_resp,
-                            &namespace_tools,
-                            &custom_tools,
-                        )
-                    };
-
-                let mut full_history = chat_req.messages;
-                full_history.extend(assistant_messages);
-                if let Some(corpus) = &state.corpus {
-                    corpus.record_turn(
-                        previous_response_id.as_deref(),
-                        &response_id,
-                        &model,
-                        &full_history,
-                    );
+        Ok(r) => {
+            let value = match r.json::<serde_json::Value>().await {
+                Ok(value) => value,
+                Err(e) => {
+                    error!("parse error: {e}");
+                    return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
                 }
-                state.sessions.save_with_id(response_id, full_history);
-                Json(resp).into_response()
+            };
+            if let Some(upstream_error) = value.get("error") {
+                let message = upstream_error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| upstream_error.as_str())
+                    .unwrap_or("upstream returned an error")
+                    .to_string();
+                error!("upstream response error: {message}");
+                return (StatusCode::BAD_GATEWAY, message).into_response();
             }
-        },
+            match serde_json::from_value::<ChatResponse>(value) {
+                Err(e) => {
+                    error!("parse error: {e}");
+                    (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
+                }
+                Ok(chat_resp) => {
+                    debug!(
+                        "← upstream function_calls={}",
+                        summarize_debug_names(chat_response_tool_call_debug_names(&chat_resp))
+                    );
+                    let response_id = state.sessions.new_id();
+                    let (resp, assistant_messages) =
+                        if namespace_tools.is_empty() && custom_tools.is_empty() {
+                            translate::from_chat_response(response_id.clone(), &model, chat_resp)
+                        } else {
+                            translate::from_chat_response_with_tool_maps(
+                                response_id.clone(),
+                                &model,
+                                chat_resp,
+                                &namespace_tools,
+                                &custom_tools,
+                            )
+                        };
+
+                    for assistant in &assistant_messages {
+                        if let Some(reasoning) = assistant
+                            .reasoning_content
+                            .as_ref()
+                            .filter(|reasoning| !reasoning.is_empty())
+                        {
+                            state.sessions.store_turn_reasoning(
+                                &chat_req.messages,
+                                assistant,
+                                reasoning.clone(),
+                            );
+                        }
+                    }
+                    let mut full_history = chat_req.messages;
+                    full_history.extend(assistant_messages);
+                    if let Some(corpus) = &state.corpus {
+                        corpus.record_turn(
+                            previous_response_id.as_deref(),
+                            &response_id,
+                            &model,
+                            &full_history,
+                        );
+                    }
+                    state.sessions.save_with_id(response_id, full_history);
+                    Json(resp).into_response()
+                }
+            }
+        }
     }
 }
 

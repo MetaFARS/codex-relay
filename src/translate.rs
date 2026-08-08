@@ -586,9 +586,30 @@ pub fn from_chat_response_with_tool_maps(
         crate::dsml::heal_chat_message(&mut choice.message);
     }
 
+    // Reasoning models served without a vLLM reasoning parser leak `<think>`
+    // markup into the text content instead of `reasoning_content`; split it out
+    // so Codex never renders it and history never replays it.
+    // Quirk `think_tags`, see quirks.rs.
+    if crate::quirks::quirk_enabled("think_tags") {
+        crate::think::heal_chat_message(&mut choice.message);
+    }
+
     let usage = chat.usage.unwrap_or_default();
     tracing::debug!("cache(non-stream): {}", usage.cache_summary());
     let mut output = Vec::new();
+
+    if let Some(reasoning) = choice
+        .message
+        .reasoning_content
+        .as_deref()
+        .filter(|reasoning| !reasoning.is_empty())
+    {
+        output.push(json!({
+            "type": "reasoning",
+            "id": format!("rs_{}", uuid::Uuid::new_v4().simple()),
+            "summary": [{"type": "summary_text", "text": reasoning}]
+        }));
+    }
 
     let text = choice.message.text_content().to_string();
     if !text.is_empty() || choice.message.tool_calls.is_none() {
@@ -631,6 +652,9 @@ pub fn from_chat_response_with_tool_maps(
                     "status": "completed"
                 });
                 if let Some(namespace) = namespace {
+                    if uses_plaintext_collaboration_args(Some(&namespace), &name) {
+                        item["encrypted_function_args"] = json!([]);
+                    }
                     item["namespace"] = Value::String(namespace);
                 }
                 item
@@ -665,6 +689,11 @@ pub(crate) fn response_function_name_for_responses(
         return (Some(tool_name.namespace.clone()), tool_name.name.clone());
     }
     split_mcp_function_name(name)
+}
+
+pub(crate) fn uses_plaintext_collaboration_args(namespace: Option<&str>, name: &str) -> bool {
+    namespace == Some("collaboration")
+        && matches!(name, "spawn_agent" | "send_message" | "followup_task")
 }
 
 pub(crate) fn split_mcp_function_name(name: &str) -> (Option<String>, String) {
@@ -1175,6 +1204,62 @@ mod tests {
     }
 
     #[test]
+    fn test_collaboration_calls_request_plaintext_arguments() {
+        let call_names = [
+            "collaboration-spawn_agent",
+            "collaboration-send_message",
+            "collaboration-followup_task",
+            "collaboration-wait",
+            "unrelated",
+        ];
+        let chat = ChatResponse {
+            choices: vec![ChatChoice {
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(
+                        call_names
+                            .iter()
+                            .enumerate()
+                            .map(|(index, name)| {
+                                json!({
+                                    "id": format!("call_{index}"),
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": "{}"}
+                                })
+                            })
+                            .collect(),
+                    ),
+                    tool_call_id: None,
+                    name: None,
+                },
+            }],
+            usage: None,
+        };
+        let tools = vec![json!({
+            "type": "namespace",
+            "name": "collaboration",
+            "tools": [
+                {"type": "function", "name": "spawn_agent"},
+                {"type": "function", "name": "send_message"},
+                {"type": "function", "name": "followup_task"},
+                {"type": "function", "name": "wait"}
+            ]
+        })];
+        let namespace_tools = namespace_tool_map(&tools);
+
+        let (resp, _) =
+            from_chat_response_with_tool_map("resp_1".into(), "test-model", chat, &namespace_tools);
+        for item in &resp.output[..3] {
+            assert_eq!(item["namespace"], "collaboration");
+            assert_eq!(item["encrypted_function_args"], json!([]));
+        }
+        assert!(resp.output[3].get("encrypted_function_args").is_none());
+        assert!(resp.output[4].get("encrypted_function_args").is_none());
+    }
+
+    #[test]
     fn test_from_chat_response_preserves_hyphen_flat_tool_name() {
         let chat = ChatResponse {
             choices: vec![ChatChoice {
@@ -1435,6 +1520,21 @@ mod tests {
         let chat = to_chat_request(&req, vec![], &sessions);
         assert!(chat.messages[0].content.as_ref().unwrap().is_string());
         assert_eq!(chat.messages[0].text_content(), "hi");
+    }
+
+    #[test]
+    fn test_agent_message_plaintext_input_reaches_chat_upstream() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![json!({
+        "type": "agent_message",
+        "author": "agent-a",
+        "recipient": "agent-b",
+        "content": [
+            {"type": "input_text", "text": "do the task"}
+        ]})]));
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert!(chat.messages[0].content.as_ref().unwrap().is_string());
+        assert_eq!(chat.messages[0].text_content(), "do the task");
     }
 
     #[test]

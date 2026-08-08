@@ -112,12 +112,10 @@ pub fn parse_leaked_tool_calls(text: &str) -> Option<(String, Vec<DsmlToolCall>)
     while let Some((dialect, start)) = find_next_invoke(text, search_from) {
         match parse_invoke(text, start, dialect) {
             Ok((end, call)) => {
-                let removal_start = envelope_start(text, copied_through, start, dialect);
-                let removal_end = envelope_end(text, end, dialect);
-                cleaned.push_str(&text[copied_through..removal_start]);
+                cleaned.push_str(&text[copied_through..start]);
                 calls.push(call);
-                copied_through = removal_end;
-                search_from = removal_end;
+                copied_through = end;
+                search_from = end;
             }
             Err(()) => {
                 // Preserve malformed candidates byte-for-byte, but continue so
@@ -134,7 +132,7 @@ pub fn parse_leaked_tool_calls(text: &str) -> Option<(String, Vec<DsmlToolCall>)
         return None;
     }
     cleaned.push_str(&text[copied_through..]);
-    Some((cleaned.trim().to_string(), calls))
+    Some((strip_empty_envelopes(cleaned), calls))
 }
 
 #[derive(Debug)]
@@ -255,19 +253,37 @@ fn parse_invoke(
 /// Find the balanced end of a malformed invoke so recovery never descends
 /// into a nested, valid-looking call and executes it out of context.
 fn malformed_invoke_end(text: &str, start: usize, dialect: DsmlDialect) -> Option<usize> {
-    let outer = parse_open_tag(text, start, dialect).ok()?;
+    let outer = scan_open_tag(text, start, dialect)?;
     if outer.name != "invoke" || outer.self_closing {
         return Some(outer.end);
     }
     let mut depth = 1usize;
     let mut cursor = outer.end;
     while cursor < text.len() {
+        let next_foreign_open = DIALECTS
+            .iter()
+            .filter(|candidate| **candidate != dialect)
+            .filter_map(|candidate| {
+                text[cursor..]
+                    .find(candidate.marker)
+                    .map(|offset| cursor + offset)
+            })
+            .min();
         let next_open = text[cursor..]
             .find(dialect.marker)
             .map(|offset| cursor + offset);
         let next_close = text[cursor..]
             .find(dialect.invoke_close)
             .map(|offset| cursor + offset);
+        let next_current = next_open.into_iter().chain(next_close).min();
+        if next_foreign_open
+            .is_some_and(|foreign| next_current.is_none_or(|current| foreign < current))
+        {
+            // Mixed-dialect structure inside a malformed invoke cannot be
+            // balanced by this dialect's stack. Stop rather than recovering
+            // at a forged close and exposing the foreign nested call.
+            return None;
+        }
         match (next_open, next_close) {
             (None, Some(close)) => {
                 depth -= 1;
@@ -284,13 +300,75 @@ fn malformed_invoke_end(text: &str, start: usize, dialect: DsmlDialect) -> Optio
                 }
             }
             (Some(open), _) => {
-                let tag = parse_open_tag(text, open, dialect).ok()?;
+                let tag = scan_open_tag(text, open, dialect)?;
                 if tag.name == "invoke" && !tag.self_closing {
                     depth += 1;
+                } else if tag.name == "parameter" && !tag.self_closing {
+                    let close = parameter_close(dialect);
+                    let tail = &text[tag.end..];
+                    let close_offset = tail.find(&close)?;
+                    // A nested opening tag makes the parameter boundary
+                    // ambiguous. Stop recovery rather than borrowing its
+                    // closing tag and exposing a nested call for execution.
+                    if tail
+                        .find(dialect.marker)
+                        .is_some_and(|offset| offset < close_offset)
+                    {
+                        return None;
+                    }
+                    cursor = tag.end + close_offset + close.len();
+                    continue;
                 }
                 cursor = tag.end;
             }
             (None, None) => return None,
+        }
+    }
+    None
+}
+
+/// Locate a tag boundary without accepting its attributes. Recovery needs to
+/// skip a malformed candidate before looking for a later sibling, but using
+/// the strict parser here would make a bounded error such as `name=bad` stop
+/// all scanning. Unclosed quotes remain unbounded and therefore fail closed.
+fn scan_open_tag(text: &str, start: usize, dialect: DsmlDialect) -> Option<ParsedTag> {
+    if !text[start..].starts_with(dialect.marker) {
+        return None;
+    }
+    let mut cursor = start + dialect.marker.len();
+    let name_start = cursor;
+    while let Some(ch) = text[cursor..].chars().next() {
+        if ch.is_whitespace() || matches!(ch, '/' | '>') {
+            break;
+        }
+        cursor += ch.len_utf8();
+    }
+    if cursor == name_start {
+        return None;
+    }
+    let name = text[name_start..cursor].to_string();
+    let mut quoted = false;
+    let mut escaped = false;
+    while let Some(ch) = text[cursor..].chars().next() {
+        cursor += ch.len_utf8();
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+            }
+        } else if ch == '"' {
+            quoted = true;
+        } else if ch == '>' {
+            let before = text[..cursor - 1].trim_end();
+            return Some(ParsedTag {
+                name,
+                attrs: BTreeMap::new(),
+                self_closing: before.ends_with('/'),
+                end: cursor,
+            });
         }
     }
     None
@@ -370,6 +448,13 @@ fn parse_open_tag(text: &str, start: usize, dialect: DsmlDialect) -> Result<Pars
         if attrs.insert(key, value).is_some() {
             return Err(());
         }
+        if text[cursor..]
+            .chars()
+            .next()
+            .is_some_and(|ch| !ch.is_whitespace() && !matches!(ch, '/' | '>'))
+        {
+            return Err(());
+        }
     }
 }
 
@@ -404,25 +489,39 @@ fn skip_whitespace(text: &str, mut cursor: usize) -> usize {
     cursor
 }
 
-fn envelope_start(
-    text: &str,
-    copied_through: usize,
-    invoke_start: usize,
-    dialect: DsmlDialect,
-) -> usize {
-    let prefix = &text[copied_through..invoke_start];
-    prefix
-        .rfind(dialect.calls_open)
-        .filter(|at| prefix[at + dialect.calls_open.len()..].trim().is_empty())
-        .map_or(invoke_start, |at| copied_through + at)
+fn parameter_close(dialect: DsmlDialect) -> String {
+    format!("</{}parameter>", dialect.marker.trim_start_matches('<'))
 }
 
-fn envelope_end(text: &str, invoke_end: usize, dialect: DsmlDialect) -> usize {
-    let after_whitespace = skip_whitespace(text, invoke_end);
-    if text[after_whitespace..].starts_with(dialect.calls_close) {
-        after_whitespace + dialect.calls_close.len()
-    } else {
-        invoke_end
+/// Remove only matched envelope pairs whose contents became empty after all
+/// successfully parsed invokes were removed. If malformed markup remains,
+/// both wrappers stay intact rather than deleting only one side.
+fn strip_empty_envelopes(mut text: String) -> String {
+    loop {
+        let mut removed = false;
+        for dialect in DIALECTS {
+            let mut search_from = 0;
+            while let Some(open_offset) = text[search_from..].find(dialect.calls_open) {
+                let open = search_from + open_offset;
+                let inner = open + dialect.calls_open.len();
+                let Some(close_offset) = text[inner..].find(dialect.calls_close) else {
+                    break;
+                };
+                let close = inner + close_offset;
+                if text[inner..close].trim().is_empty() {
+                    text.replace_range(open..close + dialect.calls_close.len(), "");
+                    removed = true;
+                    break;
+                }
+                search_from = close + dialect.calls_close.len();
+            }
+            if removed {
+                break;
+            }
+        }
+        if !removed {
+            return text;
+        }
     }
 }
 
@@ -558,7 +657,7 @@ mod tests {
     fn parses_leaked_envelope() {
         let text = format!("我来读取文件。\n{ENVELOPE}");
         let (cleaned, calls) = parse_leaked_tool_calls(&text).expect("healed");
-        assert_eq!(cleaned, "我来读取文件。");
+        assert_eq!(cleaned, "我来读取文件。\n");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
         let args: Value = serde_json::from_str(&calls[0].arguments).unwrap();
@@ -602,7 +701,7 @@ mod tests {
     fn parses_double_bar_envelope_with_self_closing_parameters() {
         let text = format!("Let me run it.\n{DOUBLE_BAR_ENVELOPE}");
         let (cleaned, calls) = parse_leaked_tool_calls(&text).expect("healed");
-        assert_eq!(cleaned, "Let me run it.");
+        assert_eq!(cleaned, "Let me run it.\n");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "exec_command");
         let args: Value = serde_json::from_str(&calls[0].arguments).unwrap();
@@ -649,7 +748,7 @@ mod tests {
             format!("{DOUBLE_BAR_ENVELOPE}\n{ENVELOPE}"),
         ] {
             let (cleaned, calls) = parse_leaked_tool_calls(&text).expect("healed");
-            assert_eq!(cleaned, "");
+            assert_eq!(cleaned, "\n");
             assert_eq!(calls.len(), 2);
             if text.starts_with("<｜DSML｜") {
                 assert_eq!(calls[0].name, "shell");
@@ -666,7 +765,7 @@ mod tests {
         let malformed = "<｜DSML｜invoke_extra name=\"not_a_call\">raw</｜DSML｜invoke_extra>";
         let text = format!("{malformed}\n{DOUBLE_BAR_ENVELOPE}");
         let (cleaned, calls) = parse_leaked_tool_calls(&text).expect("later call healed");
-        assert_eq!(cleaned, malformed);
+        assert_eq!(cleaned, format!("{malformed}\n"));
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "exec_command");
     }
@@ -695,7 +794,7 @@ mod tests {
             "<｜｜DSML｜｜invoke name=\"bad\"><｜｜DSML｜｜invoke name=\"cmd\" /></｜｜DSML｜｜invoke>";
         let text = format!("{malformed}\n{ENVELOPE}");
         let (cleaned, calls) = parse_leaked_tool_calls(&text).expect("later call healed");
-        assert_eq!(cleaned, malformed);
+        assert_eq!(cleaned, format!("{malformed}\n"));
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
     }
@@ -705,9 +804,103 @@ mod tests {
         let malformed = "<｜｜DSML｜｜invoke name=\"bad\">\n<｜｜DSML｜｜invoke name=\"exec_command\">\n<｜｜DSML｜｜invoke name=\"cmd\" string=\"echo bad\" />\n</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜invoke>";
         let text = format!("{malformed}\n{ENVELOPE}");
         let (cleaned, calls) = parse_leaked_tool_calls(&text).expect("later sibling healed");
-        assert_eq!(cleaned, malformed);
+        assert_eq!(cleaned, format!("{malformed}\n"));
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
+    }
+
+    #[test]
+    fn invoke_close_inside_parameter_cannot_expose_nested_call() {
+        let malformed = "<｜DSML｜invoke name=\"bad\">\n<｜DSML｜parameter name=\"x\" string=\"true\">literal </｜DSML｜invoke></｜DSML｜parameter>\n<｜DSML｜invoke name=\"shell\">\n<｜DSML｜parameter name=\"command\" string=\"true\">echo bad</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜invoke>";
+        assert!(parse_leaked_tool_calls(malformed).is_none());
+
+        let text = format!("{malformed}\n{ENVELOPE}");
+        let (cleaned, calls) = parse_leaked_tool_calls(&text).expect("later sibling healed");
+        assert!(cleaned.starts_with(malformed));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+    }
+
+    #[test]
+    fn foreign_dialect_parameter_cannot_expose_nested_call() {
+        let cases = [
+            "<｜DSML｜invoke name=\"bad\"><｜｜DSML｜｜parameter name=\"x\" string=\"true\">literal </｜DSML｜invoke></｜｜DSML｜｜parameter><｜｜DSML｜｜invoke name=\"exec_command\"><｜｜DSML｜｜invoke name=\"cmd\" string=\"echo bad\" /></｜｜DSML｜｜invoke></｜DSML｜invoke>",
+            "<｜｜DSML｜｜invoke name=\"bad\"><｜DSML｜parameter name=\"x\" string=\"true\">literal </｜｜DSML｜｜invoke></｜DSML｜parameter><｜DSML｜invoke name=\"shell\"><｜DSML｜parameter name=\"command\" string=\"true\">echo bad</｜DSML｜parameter></｜DSML｜invoke></｜｜DSML｜｜invoke>",
+        ];
+        for malformed in cases {
+            assert!(
+                parse_leaked_tool_calls(malformed).is_none(),
+                "foreign nested call must not execute: {malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn attributes_require_whitespace_separators() {
+        for malformed in [
+            "<｜DSML｜invoke name=\"shell\"><｜DSML｜parameter name=\"command\"string=\"true\">echo bad</｜DSML｜parameter></｜DSML｜invoke>",
+            "<｜｜DSML｜｜invoke name=\"exec_command\"><｜｜DSML｜｜invoke name=\"cmd\"string=\"echo bad\" /></｜｜DSML｜｜invoke>",
+        ] {
+            assert!(parse_leaked_tool_calls(malformed).is_none());
+        }
+    }
+
+    #[test]
+    fn bounded_malformed_open_tag_does_not_block_later_sibling() {
+        let malformed = "<｜｜DSML｜｜invoke name=bad></｜｜DSML｜｜invoke>";
+        let text = format!("{malformed}\n{ENVELOPE}");
+        let (cleaned, calls) = parse_leaked_tool_calls(&text).expect("later sibling healed");
+        assert!(cleaned.starts_with(malformed));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+    }
+
+    #[test]
+    fn unbounded_malformed_open_tag_fails_closed() {
+        let malformed = "<｜｜DSML｜｜invoke name=\"unterminated></｜｜DSML｜｜invoke>";
+        let text = format!("{malformed}\n{ENVELOPE}");
+        assert!(parse_leaked_tool_calls(&text).is_none());
+    }
+
+    #[test]
+    fn mixed_validity_envelope_keeps_both_wrappers() {
+        let valid = "<｜｜DSML｜｜invoke name=\"exec_command\"><｜｜DSML｜｜invoke name=\"cmd\" string=\"echo good\" /></｜｜DSML｜｜invoke>";
+        let malformed = "<｜｜DSML｜｜invoke name=\"bad\"><｜｜DSML｜｜metadata name=\"x\" /></｜｜DSML｜｜invoke>";
+        for body in [
+            format!("{valid}\n{malformed}"),
+            format!("{malformed}\n{valid}"),
+        ] {
+            let text = format!("<｜｜DSML｜｜tool_calls>\n{body}\n</｜｜DSML｜｜tool_calls>");
+            let (cleaned, calls) = parse_leaked_tool_calls(&text).expect("valid call healed");
+            assert!(cleaned.contains("<｜｜DSML｜｜tool_calls>"));
+            assert!(cleaned.contains("</｜｜DSML｜｜tool_calls>"));
+            assert!(cleaned.contains(malformed));
+            assert_eq!(calls.len(), 1);
+        }
+    }
+
+    #[test]
+    fn blocking_and_streaming_visible_text_match() {
+        for (prefix, expected) in [("prefix\n", "prefix\n"), ("\n", "\n")] {
+            let text = format!("{prefix}{ENVELOPE}");
+            let (blocking, blocking_calls) =
+                parse_leaked_tool_calls(&text).expect("blocking healed");
+            assert_eq!(blocking, expected);
+
+            for split in text
+                .char_indices()
+                .map(|(at, _)| at)
+                .chain(std::iter::once(text.len()))
+            {
+                let mut filter = DsmlStreamFilter::default();
+                let mut streamed = filter.push(&text[..split]);
+                streamed.push_str(&filter.push(&text[split..]));
+                let (leftover, calls) = filter.finish();
+                streamed.push_str(&leftover);
+                assert_eq!(streamed, blocking, "split at byte {split}");
+                assert_eq!(calls, blocking_calls, "split at byte {split}");
+            }
+        }
     }
 
     #[test]
@@ -760,7 +953,7 @@ mod tests {
             emitted.push_str(&filter.push(&ch.to_string()));
         }
         let (leftover, calls) = filter.finish();
-        assert_eq!(format!("{emitted}{leftover}"), "prefix\n");
+        assert_eq!(format!("{emitted}{leftover}"), "prefix\n\n");
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "shell");
         assert_eq!(calls[1].name, "exec_command");
@@ -829,7 +1022,7 @@ mod tests {
             name: None,
         };
         heal_chat_message(&mut message);
-        assert_eq!(message.text_content(), "我来逐步完成这个任务。");
+        assert_eq!(message.text_content(), "我来逐步完成这个任务。\n");
         let tool_calls = message.tool_calls.as_ref().expect("healed tool_calls");
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0]["function"]["name"], "shell");

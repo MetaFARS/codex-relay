@@ -17,9 +17,9 @@ use crate::{
     session::SessionStore,
     think::ThinkStreamFilter,
     translate::{
-        allowed_upstream_tool_names, custom_tool_input, response_function_name_for_responses,
-        uses_plaintext_collaboration_args, validate_tool_call_entries, CustomToolMap,
-        NamespaceToolMap,
+        allowed_upstream_tool_names, completed_tool_arguments, custom_tool_input,
+        response_function_name_for_responses, uses_plaintext_collaboration_args,
+        validate_tool_call_entries, CustomToolMap, NamespaceToolMap,
     },
     types::{ChatMessage, ChatRequest, ChatStreamChunk, ChatUsage},
     upstream_request::UpstreamRequestConfig,
@@ -556,6 +556,7 @@ pub fn translate_stream(
             let output_index = base_index + rel_idx;
             let (namespace, name) = response_function_name_for_responses(&tc.name, &namespace_tools);
             let custom = custom_tools.get(&tc.name);
+            let arguments = completed_tool_arguments(&tc.arguments);
             let fc_item_id = if custom.is_some() {
                 format!("ctc_{}", uuid::Uuid::new_v4().simple())
             } else {
@@ -596,7 +597,7 @@ pub fn translate_stream(
                     "id": &fc_item_id,
                     "call_id": &tc.id,
                     "name": &name,
-                    "arguments": &tc.arguments,
+                    "arguments": arguments,
                     "status": "completed"
                 });
                 if let Some(namespace) = namespace {
@@ -667,7 +668,10 @@ pub fn translate_stream(
                 Some(tool_calls.values().map(|tc| json!({
                     "id": &tc.id,
                     "type": "function",
-                    "function": { "name": &tc.name, "arguments": &tc.arguments }
+                    "function": {
+                        "name": &tc.name,
+                        "arguments": completed_tool_arguments(&tc.arguments)
+                    }
                 })).collect())
             };
             let assistant_msg = ChatMessage {

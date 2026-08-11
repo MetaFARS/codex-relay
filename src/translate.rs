@@ -50,6 +50,12 @@ pub fn to_chat_request(
 ) -> ChatRequest {
     let mut messages = history;
 
+    // Repair sessions persisted by older relay versions before their invalid
+    // empty argument strings are replayed to a strict upstream provider.
+    for message in &mut messages {
+        complete_message_tool_arguments(message);
+    }
+
     // History can contain poison blank messages from an earlier turn. Remove
     // them before deciding whether an existing system prompt suppresses the
     // current request's instructions. Keep the newest one as a fallback in
@@ -176,6 +182,7 @@ pub fn to_chat_request(
                         } else {
                             cur.get("arguments")
                                 .and_then(Value::as_str)
+                                .map(completed_tool_arguments)
                                 .unwrap_or("{}")
                                 .to_string()
                         };
@@ -457,6 +464,37 @@ pub(crate) fn validate_tool_call_entries<'a>(
     Ok(())
 }
 
+/// Chat Completions providers may omit the arguments delta for a function
+/// whose schema has no parameters. Completed Responses items and replayed
+/// Chat Completions history still require the value to contain valid JSON.
+pub(crate) fn completed_tool_arguments(arguments: &str) -> &str {
+    if arguments.trim().is_empty() {
+        "{}"
+    } else {
+        arguments
+    }
+}
+
+fn complete_message_tool_arguments(message: &mut ChatMessage) {
+    let Some(tool_calls) = message.tool_calls.as_mut() else {
+        return;
+    };
+    for tool_call in tool_calls {
+        let Some(function) = tool_call.get_mut("function").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        match function.get("arguments") {
+            Some(Value::String(arguments)) if arguments.trim().is_empty() => {
+                function.insert("arguments".into(), Value::String("{}".into()));
+            }
+            None => {
+                function.insert("arguments".into(), Value::String("{}".into()));
+            }
+            Some(_) => {}
+        }
+    }
+}
+
 fn declared_function_name(tool: &Value) -> Option<&str> {
     tool.get("name").and_then(Value::as_str).or_else(|| {
         tool.get("function")
@@ -730,10 +768,10 @@ pub fn from_chat_response_with_tool_maps(
             let function = tool_call.get("function").unwrap_or(&Value::Null);
             let raw_name = function.get("name").and_then(Value::as_str).unwrap_or("");
             let (namespace, name) = response_function_name_for_responses(raw_name, namespace_tools);
-            let arguments = function
+            let raw_arguments = function
                 .get("arguments")
                 .and_then(Value::as_str)
-                .unwrap_or("{}");
+                .unwrap_or("");
             let call_id = tool_call.get("id").and_then(Value::as_str).unwrap_or("");
             let item = if let Some(custom) = custom_tools.get(raw_name) {
                 json!({
@@ -741,10 +779,11 @@ pub fn from_chat_response_with_tool_maps(
                     "id": format!("ctc_{}", uuid::Uuid::new_v4().simple()),
                     "call_id": call_id,
                     "name": custom.name,
-                    "input": custom_tool_input(arguments, &custom.argument_field),
+                    "input": custom_tool_input(raw_arguments, &custom.argument_field),
                     "status": "completed"
                 })
             } else {
+                let arguments = completed_tool_arguments(raw_arguments);
                 let mut item = json!({
                     "type": "function_call",
                     "id": format!("fc_{}", uuid::Uuid::new_v4().simple()),
@@ -780,6 +819,7 @@ pub fn from_chat_response_with_tool_maps(
         },
     };
 
+    complete_message_tool_arguments(&mut choice.message);
     (response, vec![choice.message])
 }
 
@@ -1755,6 +1795,152 @@ mod tests {
             &allowed
         )
         .is_ok());
+    }
+
+    #[test]
+    fn test_empty_completed_tool_arguments_become_json_object() {
+        assert_eq!(completed_tool_arguments(""), "{}");
+        assert_eq!(completed_tool_arguments(" \n\t"), "{}");
+        assert_eq!(completed_tool_arguments("{malformed"), "{malformed");
+    }
+
+    #[test]
+    fn test_non_string_tool_arguments_are_not_silently_rewritten() {
+        let mut message = ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![json!({
+                "id": "call_bad",
+                "type": "function",
+                "function": {"name": "bad", "arguments": {"unexpected": true}}
+            })]),
+            tool_call_id: None,
+            name: None,
+        };
+
+        complete_message_tool_arguments(&mut message);
+        assert_eq!(
+            message.tool_calls.as_ref().unwrap()[0]["function"]["arguments"],
+            json!({"unexpected": true})
+        );
+    }
+
+    #[test]
+    fn test_empty_function_call_arguments_are_repaired_during_replay() {
+        let sessions = SessionStore::new();
+        let req = base_req(ResponsesInput::Messages(vec![json!({
+            "type": "function_call",
+            "call_id": "call_empty",
+            "name": "no_args",
+            "arguments": ""
+        })]));
+
+        let chat = to_chat_request(&req, vec![], &sessions);
+        assert_eq!(
+            chat.messages[0].tool_calls.as_ref().unwrap()[0]["function"]["arguments"],
+            "{}"
+        );
+    }
+
+    #[test]
+    fn test_empty_arguments_in_retained_history_are_repaired_before_duplicate_input() {
+        let sessions = SessionStore::new();
+        let history = vec![ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![json!({
+                "id": "call_old",
+                "type": "function",
+                "function": {"name": "no_args", "arguments": ""}
+            })]),
+            tool_call_id: None,
+            name: None,
+        }];
+        let req = base_req(ResponsesInput::Messages(vec![json!({
+            "type": "function_call",
+            "call_id": "call_old",
+            "name": "no_args",
+            "arguments": ""
+        })]));
+
+        let chat = to_chat_request(&req, history, &sessions);
+        assert_eq!(
+            chat.messages.len(),
+            1,
+            "duplicate input call must be skipped"
+        );
+        assert_eq!(
+            chat.messages[0].tool_calls.as_ref().unwrap()[0]["function"]["arguments"],
+            "{}"
+        );
+    }
+
+    #[test]
+    fn test_empty_blocking_tool_arguments_are_completed_as_json_object() {
+        let chat = ChatResponse {
+            choices: vec![ChatChoice {
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![json!({
+                        "id": "call_empty",
+                        "type": "function",
+                        "function": {"name": "no_args", "arguments": ""}
+                    })]),
+                    tool_call_id: None,
+                    name: None,
+                },
+            }],
+            usage: None,
+        };
+
+        let (response, history) = from_chat_response("resp_empty".into(), "model", chat);
+        assert_eq!(response.output[0]["arguments"], "{}");
+        assert_eq!(
+            history[0].tool_calls.as_ref().unwrap()[0]["function"]["arguments"],
+            "{}"
+        );
+    }
+
+    #[test]
+    fn test_empty_blocking_custom_tool_arguments_remain_empty_input() {
+        let tools = vec![json!({"type": "custom", "name": "custom_empty"})];
+        let custom_tools = custom_tool_map(&tools);
+        let chat = ChatResponse {
+            choices: vec![ChatChoice {
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![json!({
+                        "id": "call_custom",
+                        "type": "function",
+                        "function": {"name": "custom_empty", "arguments": ""}
+                    })]),
+                    tool_call_id: None,
+                    name: None,
+                },
+            }],
+            usage: None,
+        };
+
+        let (response, history) = from_chat_response_with_tool_maps(
+            "resp_custom".into(),
+            "model",
+            chat,
+            &NamespaceToolMap::new(),
+            &custom_tools,
+        );
+        assert_eq!(response.output[0]["type"], "custom_tool_call");
+        assert_eq!(response.output[0]["input"], "");
+        assert_eq!(
+            history[0].tool_calls.as_ref().unwrap()[0]["function"]["arguments"],
+            "{}",
+            "chat history still requires valid JSON"
+        );
     }
 
     #[test]

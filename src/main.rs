@@ -8,7 +8,7 @@ mod translate;
 mod types;
 mod upstream_request;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use axum::{
     extract::{DefaultBodyLimit, Request, State},
     http::StatusCode,
@@ -20,7 +20,7 @@ use clap::Parser;
 use corpus::CorpusRecorder;
 use reqwest::{Client, Url};
 use session::{SessionStore, DEFAULT_MAX_SESSIONS, DEFAULT_MAX_SESSION_BYTES, DEFAULT_SESSION_TTL};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{fs, path::PathBuf, process::Command, sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 use types::*;
 use upstream_request::UpstreamRequestConfig;
@@ -59,10 +59,17 @@ struct Args {
     #[arg(long, env = "CODEX_RELAY_DROP_PARAMS")]
     drop_upstream_params: Option<String>,
 
-    /// Print a ready-to-use Codex config.toml snippet (including model_properties)
-    /// for all models exposed by the upstream provider.
+    /// Print a ready-to-use Codex config.toml snippet.
     #[arg(long)]
     print_config: bool,
+
+    /// Write a version-matched Codex model catalog and reference it from --print-config.
+    #[arg(long, requires = "print_config", value_name = "PATH")]
+    model_catalog: Option<PathBuf>,
+
+    /// Bundled Codex model whose tool protocol and instructions custom models inherit.
+    #[arg(long, requires = "model_catalog", value_name = "MODEL")]
+    model_template: Option<String>,
 
     /// Maximum completed response histories retained for previous_response_id.
     #[arg(
@@ -151,7 +158,15 @@ async fn main() -> Result<()> {
                     .trim_end_matches(".io")
             })
             .unwrap_or("custom");
-        print_codex_config(&client, &upstream, &api_key, provider_name).await;
+        print_codex_config(
+            &client,
+            &upstream,
+            &api_key,
+            provider_name,
+            args.model_catalog.as_deref(),
+            args.model_template.as_deref(),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -278,7 +293,7 @@ async fn log_upstream_models(client: Client, upstream: Arc<Url>, api_key: Arc<St
                 if !models.is_empty() {
                     info!("upstream models: {}", models.join(", "));
                     info!(
-                        "⚠️  To configure Codex with model metadata, run:  codex-relay --print-config --upstream {} {}",
+                        "⚠️  To configure Codex with model metadata, run:  codex-relay --print-config --model-catalog ~/.codex/codex-relay-models.json --upstream {} {}",
                         upstream.as_str(),
                         if api_key.is_empty() { "" } else { "--api-key ..." }
                     );
@@ -302,9 +317,16 @@ async fn cleanup_sessions(sessions: SessionStore) {
     }
 }
 
-/// Print a Codex config.toml snippet that includes model_properties for all
-/// upstream models, so users can avoid "model metadata not found" warnings.
-async fn print_codex_config(client: &Client, upstream: &Url, api_key: &str, provider_name: &str) {
+/// Print a Codex config.toml snippet and optionally generate the full model
+/// catalog required by recent Codex versions.
+async fn print_codex_config(
+    client: &Client,
+    upstream: &Url,
+    api_key: &str,
+    provider_name: &str,
+    model_catalog_path: Option<&std::path::Path>,
+    model_template: Option<&str>,
+) -> Result<()> {
     let url = format!("{}models", join_base(upstream));
     let mut builder = client.get(&url);
     if !api_key.is_empty() {
@@ -336,45 +358,202 @@ async fn print_codex_config(client: &Client, upstream: &Url, api_key: &str, prov
         }
     };
 
+    if let Some(path) = model_catalog_path {
+        let bundled = load_bundled_codex_catalog()?;
+        let catalog = build_model_catalog(bundled, &models, model_template, provider_name)?;
+        let bytes = serde_json::to_vec_pretty(&catalog)?;
+        fs::write(path, bytes)
+            .with_context(|| format!("failed to write model catalog to {}", path.display()))?;
+    }
+
     println!(
         "# ── Codex config snippet for {} ──",
         upstream.host_str().unwrap_or("custom")
     );
     println!("# Copy the lines below into ~/.codex/config.toml");
     println!();
-    println!("model_provider = \"{provider_name}\"");
+    println!("model_provider = {}", toml_string(provider_name)?);
 
     if !models.is_empty() && !models[0].starts_with('<') {
-        println!("model = \"{}\"", models[0]);
+        println!("model = {}", toml_string(&models[0])?);
     } else {
         println!("model = \"<CHOOSE_A_MODEL>\"");
     }
+    if let Some(path) = model_catalog_path {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let absolute = absolute
+            .to_str()
+            .context("model catalog path is not valid UTF-8")?;
+        println!("model_catalog_json = {}", toml_string(absolute)?);
+    } else {
+        println!("# To register upstream models in Codex's model picker, rerun with:");
+        println!("#   --model-catalog ~/.codex/codex-relay-models.json");
+    }
     println!();
-    println!("[model_providers.{provider_name}]");
-    println!("name = \"{}\"", provider_name);
-    println!("base_url = \"{}\"", upstream.as_str().trim_end_matches('/'));
-    println!("wire_api = \"responses\"");
+    println!("[model_providers.{}]", toml_string(provider_name)?);
+    println!("name = {}", toml_string(provider_name)?);
     println!(
-        "env_key = \"{}_API_KEY\"",
+        "base_url = {}",
+        toml_string(upstream.as_str().trim_end_matches('/'))?
+    );
+    println!("wire_api = \"responses\"");
+    let env_key = format!(
+        "{}_API_KEY",
         provider_name.to_uppercase().replace(['-', '.'], "_")
     );
+    println!("env_key = {}", toml_string(&env_key)?);
     println!();
+    Ok(())
+}
 
-    for model in &models {
-        let props = estimate_model_properties(model);
-        println!("[model_properties.\"{}\"]", model);
-        println!("context_window = {}", props.context_window);
-        println!("max_context_window = {}", props.max_context_window);
-        println!(
-            "supports_parallel_tool_calls = {}",
-            props.supports_parallel_tool_calls
+fn toml_string(value: &str) -> Result<String> {
+    serde_json::to_string(value).context("failed to quote TOML string")
+}
+
+fn load_bundled_codex_catalog() -> Result<serde_json::Value> {
+    let output = Command::new("codex")
+        .args(["debug", "models", "--bundled"])
+        .output()
+        .context("failed to run `codex debug models --bundled`; install Codex CLI or omit --model-catalog")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("`codex debug models --bundled` failed: {}", stderr.trim());
+    }
+    serde_json::from_slice(&output.stdout)
+        .context("failed to parse the bundled model catalog from the installed Codex CLI")
+}
+
+fn build_model_catalog(
+    mut catalog: serde_json::Value,
+    upstream_models: &[String],
+    template_slug: Option<&str>,
+    provider_name: &str,
+) -> Result<serde_json::Value> {
+    let models = catalog
+        .get_mut("models")
+        .and_then(serde_json::Value::as_array_mut)
+        .context("the installed Codex CLI returned a catalog without a models array")?;
+    let template = if let Some(slug) = template_slug {
+        models
+            .iter()
+            .find(|model| model.get("slug").and_then(serde_json::Value::as_str) == Some(slug))
+            .cloned()
+            .with_context(|| {
+                format!("model template `{slug}` was not found in the bundled catalog")
+            })?
+    } else {
+        models
+            .iter()
+            .find(|model| {
+                model.get("visibility").and_then(serde_json::Value::as_str) == Some("list")
+            })
+            .or_else(|| models.first())
+            .cloned()
+            .context("the installed Codex CLI returned an empty bundled catalog")?
+    };
+
+    for (index, slug) in upstream_models.iter().enumerate() {
+        if slug.starts_with('<') {
+            continue;
+        }
+        let existing_index = models
+            .iter()
+            .position(|model| model.get("slug").and_then(serde_json::Value::as_str) == Some(slug));
+        let props = estimate_model_properties(slug);
+        let mut model = template.clone();
+        let object = model
+            .as_object_mut()
+            .context("the bundled model template was not a JSON object")?;
+        object.insert("slug".into(), serde_json::Value::String(slug.clone()));
+        object.insert(
+            "display_name".into(),
+            serde_json::Value::String(slug.clone()),
         );
-        println!(
-            "supports_reasoning_summaries = {}",
-            props.supports_reasoning_summaries
+        object.insert(
+            "description".into(),
+            serde_json::Value::String(format!("{slug} via {provider_name}")),
         );
-        println!("input_modalities = [\"text\"]");
-        println!();
+        object.insert(
+            "visibility".into(),
+            serde_json::Value::String("list".into()),
+        );
+        object.insert("supported_in_api".into(), serde_json::Value::Bool(true));
+        object.insert("priority".into(), serde_json::json!(10_000 + index));
+        object.insert(
+            "context_window".into(),
+            serde_json::json!(props.context_window),
+        );
+        object.insert(
+            "max_context_window".into(),
+            serde_json::json!(props.max_context_window),
+        );
+        object.insert(
+            "supports_parallel_tool_calls".into(),
+            serde_json::Value::Bool(props.supports_parallel_tool_calls),
+        );
+        set_existing(
+            object,
+            "supports_reasoning_summaries",
+            serde_json::Value::Bool(props.supports_reasoning_summaries),
+        );
+        set_existing(
+            object,
+            "supports_reasoning_summary_parameter",
+            serde_json::Value::Bool(props.supports_reasoning_summaries),
+        );
+        object.insert("input_modalities".into(), serde_json::json!(["text"]));
+
+        // Preserve version-sensitive instructions and tool encodings from the
+        // template, while disabling capabilities the relay does not promise.
+        set_existing(object, "prefer_websockets", serde_json::Value::Bool(false));
+        object.insert("support_verbosity".into(), serde_json::Value::Bool(false));
+        object.insert("default_verbosity".into(), serde_json::Value::Null);
+        object.insert("default_reasoning_level".into(), serde_json::Value::Null);
+        object.insert("supported_reasoning_levels".into(), serde_json::json!([]));
+        set_existing(
+            object,
+            "supports_image_detail_original",
+            serde_json::Value::Bool(false),
+        );
+        object.insert(
+            "supports_search_tool".into(),
+            serde_json::Value::Bool(false),
+        );
+        object.insert("use_responses_lite".into(), serde_json::Value::Bool(false));
+        object.insert("tool_mode".into(), serde_json::Value::Null);
+        object.insert("multi_agent_version".into(), serde_json::Value::Null);
+        object.insert("experimental_supported_tools".into(), serde_json::json!([]));
+        object.insert("additional_speed_tiers".into(), serde_json::json!([]));
+        object.insert("service_tiers".into(), serde_json::json!([]));
+        object.insert("default_service_tier".into(), serde_json::Value::Null);
+        object.insert("availability_nux".into(), serde_json::Value::Null);
+        object.insert("upgrade".into(), serde_json::Value::Null);
+        object.insert("auto_review_model_override".into(), serde_json::Value::Null);
+        object.insert("auto_compact_token_limit".into(), serde_json::Value::Null);
+        object.insert("comp_hash".into(), serde_json::Value::Null);
+        object.remove("minimal_client_version");
+        object.remove("available_in_plans");
+        if let Some(index) = existing_index {
+            models[index] = model;
+        } else {
+            models.push(model);
+        }
+    }
+
+    Ok(catalog)
+}
+
+fn set_existing(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: serde_json::Value,
+) {
+    if object.contains_key(key) {
+        object.insert(key.into(), value);
     }
 }
 
@@ -1523,5 +1702,126 @@ mod tests {
         assert_eq!(props.max_context_window, 128_000);
         assert!(!props.supports_reasoning_summaries);
         assert!(props.supports_parallel_tool_calls);
+    }
+
+    #[test]
+    fn test_toml_string_quotes_untrusted_model_ids() {
+        assert_eq!(
+            toml_string("model\"\nnotify = [\"bad\"]").unwrap(),
+            "\"model\\\"\\nnotify = [\\\"bad\\\"]\""
+        );
+    }
+
+    #[test]
+    fn test_build_model_catalog_preserves_bundled_models_and_template_protocol() {
+        let bundled = serde_json::json!({
+            "models": [{
+                "slug": "codex-template",
+                "display_name": "Codex Template",
+                "description": "bundled",
+                "visibility": "list",
+                "supported_in_api": true,
+                "priority": 1,
+                "base_instructions": "version-matched instructions",
+                "model_messages": {"instructions_template": "version-matched template"},
+                "shell_type": "shell_command",
+                "apply_patch_tool_type": "freeform",
+                "prefer_websockets": true,
+                "support_verbosity": true,
+                "default_verbosity": "medium",
+                "default_reasoning_level": "high",
+                "supported_reasoning_levels": [{"effort": "high", "description": "deep"}],
+                "supports_reasoning_summaries": true,
+                "supports_reasoning_summary_parameter": true,
+                "supports_search_tool": true,
+                "supports_image_detail_original": true,
+                "use_responses_lite": true,
+                "tool_mode": "code_mode_only",
+                "multi_agent_version": "v2",
+                "experimental_supported_tools": ["unknown"],
+                "additional_speed_tiers": ["fast"],
+                "service_tiers": [{"id": "fast"}],
+                "availability_nux": {"message": "new"},
+                "upgrade": {"id": "next"},
+                "comp_hash": "template-only"
+            }]
+        });
+
+        let catalog = build_model_catalog(
+            bundled,
+            &["deepseek-r1".into()],
+            Some("codex-template"),
+            "provider",
+        )
+        .unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["slug"], "codex-template");
+        let generated = &models[1];
+        assert_eq!(generated["slug"], "deepseek-r1");
+        assert_eq!(
+            generated["base_instructions"],
+            "version-matched instructions"
+        );
+        assert_eq!(
+            generated["model_messages"]["instructions_template"],
+            "version-matched template"
+        );
+        assert_eq!(generated["shell_type"], "shell_command");
+        assert_eq!(generated["apply_patch_tool_type"], "freeform");
+        assert_eq!(generated["prefer_websockets"], false);
+        assert_eq!(
+            generated["supported_reasoning_levels"],
+            serde_json::json!([])
+        );
+        assert_eq!(generated["supports_reasoning_summaries"], true);
+        assert_eq!(generated["supports_reasoning_summary_parameter"], true);
+        assert_eq!(generated["supports_image_detail_original"], false);
+        assert_eq!(generated["context_window"], 262_144);
+        assert_eq!(generated["tool_mode"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_build_model_catalog_sanitizes_bundled_slug_collision() {
+        let bundled = serde_json::json!({"models": [{
+            "slug": "same-model",
+            "display_name": "Bundled",
+            "visibility": "list",
+            "prefer_websockets": true,
+            "supports_reasoning_summary_parameter": true,
+            "supports_search_tool": true,
+            "supports_image_detail_original": true,
+            "use_responses_lite": true,
+            "tool_mode": "code_mode_only",
+            "multi_agent_version": "v2"
+        }]});
+
+        let catalog = build_model_catalog(
+            bundled,
+            &["same-model".into()],
+            Some("same-model"),
+            "provider",
+        )
+        .unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["display_name"], "same-model");
+        assert_eq!(models[0]["prefer_websockets"], false);
+        assert_eq!(models[0]["supports_reasoning_summary_parameter"], false);
+        assert_eq!(models[0]["supports_search_tool"], false);
+        assert_eq!(models[0]["supports_image_detail_original"], false);
+        assert_eq!(models[0]["use_responses_lite"], false);
+        assert_eq!(models[0]["tool_mode"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_build_model_catalog_rejects_unknown_template() {
+        let bundled = serde_json::json!({"models": [{
+            "slug": "known",
+            "visibility": "list"
+        }]});
+        let error = build_model_catalog(bundled, &["upstream".into()], Some("missing"), "provider")
+            .unwrap_err();
+        assert!(error.to_string().contains("was not found"));
     }
 }

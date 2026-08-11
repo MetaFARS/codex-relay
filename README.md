@@ -39,38 +39,36 @@ On startup, the relay logs the available upstream models and prints a hint:
 ```bash
 codex-relay --print-config \
   --upstream https://api.deepseek.com/v1 \
-  --api-key $DEEPSEEK_API_KEY
+  --api-key $DEEPSEEK_API_KEY \
+  --model-catalog ~/.codex/codex-relay-models.json
 ```
 
-This prints a ready-to-use `~/.codex/config.toml` snippet that includes
-`model_properties` for every upstream model, so Codex knows model capabilities
-and you won't see the **"Model metadata … not found"** warning.
+This prints a ready-to-use `~/.codex/config.toml` snippet and writes a model
+catalog containing both Codex's built-in models and every upstream model, so
+you won't see the **"Model metadata … not found"** warning. The generated
+entries inherit version-sensitive instructions and tool formats from the
+installed Codex CLI. Use `--model-template <MODEL>` to select a different
+bundled model as that template.
 
 If you prefer to write the config by hand, here is the minimal form:
 
 ```toml
 model = "deepseek-chat"
 model_provider = "deepseek-relay"
+model_catalog_json = "/home/user/.codex/codex-relay-models.json"
 
 [model_providers.deepseek-relay]
 name = "DeepSeek"
 base_url = "http://127.0.0.1:4446/v1"
 wire_api = "responses"
 env_key = "DEEPSEEK_API_KEY"
-
-[model_properties."deepseek-chat"]
-context_window = 262144
-max_context_window = 1048576
-supports_parallel_tool_calls = true
-supports_reasoning_summaries = false
-input_modalities = ["text"]
 ```
 
-> ⚠️ **Without `model_properties`**, Codex CLI defaults to fallback metadata
-> for any model it doesn't recognize natively. This can degrade performance,
-> tool-call reliability, and context-window management. The relay logs a
-> reminder at startup and offers `--print-config` to eliminate this class
-> of problem entirely.
+> Recent Codex versions use `model_catalog_json`; the former
+> `[model_properties]` config syntax is no longer supported. A custom catalog
+> replaces the built-in catalog, so `codex-relay` starts with the catalog from
+> your installed Codex version and appends upstream models instead of creating
+> an incomplete replacement.
 
 **3. Use Codex normally** — it routes through the relay transparently.
 
@@ -85,7 +83,9 @@ input_modalities = ["text"]
 | `--upstream-extra-params` | `CODEX_RELAY_UPSTREAM_EXTRA_PARAMS` | _(empty)_ | JSON object merged into each upstream Chat Completions request |
 | `--drop-upstream-params` | `CODEX_RELAY_DROP_PARAMS` | _(empty)_ | JSON array of top-level upstream request parameters to remove |
 | `--model-map` | `CODEX_RELAY_MODEL_MAP` | _(empty)_ | Comma-separated `source:target` model name translations |
-| `--print-config` | _(none)_ | — | Print a Codex config snippet with `model_properties` and exit |
+| `--print-config` | _(none)_ | — | Print a Codex config snippet and exit |
+| `--model-catalog` | _(none)_ | — | With `--print-config`, write a version-matched full model catalog to this path |
+| `--model-template` | _(none)_ | first visible bundled model | Bundled Codex model whose instructions and tool formats generated entries inherit |
 | `--record-corpus` | `CODEX_RELAY_RECORD_CORPUS` | _(off)_ | Append the conversation flow of every completed turn to daily JSONL files (OpenAI messages format) in this directory |
 | `--session-ttl-hours` | `CODEX_RELAY_SESSION_TTL_HOURS` | `168` | Retain idle `previous_response_id` history and reasoning state for this many hours |
 | `--max-sessions` | `CODEX_RELAY_MAX_SESSIONS` | `256` | Maximum completed response histories retained for continuation |

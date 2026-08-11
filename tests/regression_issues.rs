@@ -1707,6 +1707,76 @@ async fn issue_17_streaming_namespaced_tool_calls_emit_namespace_field() {
 }
 
 #[tokio::test]
+async fn issue_57_streaming_zero_argument_tool_call_is_valid_json_and_replays() {
+    let tool_sse = sse_from_chunks(vec![json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_no_args",
+                    "function": {"name": "no_args"}
+                }]
+            }
+        }]
+    })]);
+    let (upstream_port, bodies) =
+        spawn_mock_upstream_with_responses(vec![tool_sse, default_ok_sse()]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+    let tool = json!({
+        "type": "function",
+        "name": "no_args",
+        "parameters": {"type": "object", "properties": {}}
+    });
+
+    let events = post_stream_events(
+        &relay,
+        json!({
+            "model": "mock-model",
+            "input": "Call it.",
+            "tools": [tool.clone()],
+            "stream": true
+        }),
+    )
+    .await;
+    let done = events
+        .iter()
+        .find(|(event, data)| {
+            event == "response.output_item.done" && data["item"]["type"] == "function_call"
+        })
+        .map(|(_, data)| &data["item"])
+        .expect("function_call done item");
+    assert_eq!(done["arguments"], "{}");
+    let completed = events
+        .iter()
+        .find_map(|(event, data)| (event == "response.completed").then_some(data))
+        .expect("response.completed");
+    assert_eq!(completed["response"]["output"][0]["arguments"], "{}");
+    let response_id = completed["response"]["id"].as_str().unwrap();
+
+    post_stream_completed(
+        &relay,
+        json!({
+            "model": "mock-model",
+            "previous_response_id": response_id,
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call_no_args",
+                "output": "done"
+            }],
+            "tools": [tool],
+            "stream": true
+        }),
+    )
+    .await;
+
+    let requests = bodies.lock().unwrap();
+    assert_eq!(
+        requests[1]["messages"][1]["tool_calls"][0]["function"]["arguments"], "{}",
+        "persisted tool calls must replay with valid JSON arguments"
+    );
+}
+
+#[tokio::test]
 async fn issue_43_streaming_collaboration_calls_request_plaintext_arguments() {
     let tool_sse = sse_from_chunks(vec![
         json!({

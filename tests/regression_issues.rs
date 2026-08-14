@@ -1992,6 +1992,73 @@ async fn issue_37_streaming_apply_patch_emits_custom_tool_events() {
 }
 
 #[tokio::test]
+async fn issue_61_streaming_nested_custom_tool_keeps_bare_name() {
+    let input = "console.log('ok')";
+    let arguments = json!({"input": input}).to_string();
+    let tool_sse = sse_from_chunks(vec![
+        json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_exec",
+                        "function": {
+                            "name": "exec",
+                            "arguments": arguments
+                        }
+                    }]
+                }
+            }]
+        }),
+        json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}),
+    ]);
+    let (upstream_port, bodies) = spawn_mock_upstream_with_responses(vec![tool_sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({
+            "model": "mock-model",
+            "input": "Run the code.",
+            "tools": [{
+                "type": "namespace",
+                "name": "functions",
+                "tools": [
+                    {"type": "custom", "name": "exec", "description": "Run code"},
+                    {"type": "function", "name": "wait", "parameters": {"type": "object"}}
+                ]
+            }],
+            "stream": true
+        }),
+    )
+    .await;
+
+    let done = events
+        .iter()
+        .find(|(event, data)| {
+            event == "response.output_item.done" && data["item"]["type"] == "custom_tool_call"
+        })
+        .map(|(_, data)| &data["item"])
+        .expect("custom_tool_call done item");
+    assert_eq!(done["name"], "exec");
+    assert_eq!(done["input"], input);
+    assert!(done.get("namespace").is_none());
+
+    let request_bodies = bodies.lock().unwrap();
+    let names: Vec<&str> = request_bodies[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
+    assert_eq!(names, ["exec", "functions-wait"]);
+    assert_eq!(
+        request_bodies[0]["tools"][0]["function"]["parameters"]["required"],
+        json!(["input"])
+    );
+}
+
+#[tokio::test]
 async fn issue_12_spawn_agent_child_context_should_not_replay_parent_history() {
     let child_task = "Please compute 2+2 and return only the numeric result.";
     let parent_prompt = "Ask a subagent to solve 2+2.";

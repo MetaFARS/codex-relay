@@ -389,34 +389,52 @@ pub fn namespace_tool_map(tools: &[Value]) -> NamespaceToolMap {
 
 pub fn custom_tool_map(tools: &[Value]) -> CustomToolMap {
     let denied = tool_denylist_from_env();
-    tools
-        .iter()
-        .filter_map(|tool| {
-            let tool_type = tool.get("type").and_then(Value::as_str)?;
-            let name = tool.get("name").and_then(Value::as_str)?;
-            if denied.contains(name) {
-                return None;
+    let mut map = CustomToolMap::new();
+    for tool in tools {
+        if let Some((name, custom)) = custom_tool_entry(tool, &denied) {
+            map.insert(name, custom);
+        }
+        if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+            for sub in tool
+                .get("tools")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|sub| sub.get("type").and_then(Value::as_str) == Some("custom"))
+            {
+                if let Some((name, custom)) = custom_tool_entry(sub, &denied) {
+                    map.insert(name, custom);
+                }
             }
-            let argument_field = match tool_type {
-                "custom" => custom_argument_field(name).to_string(),
-                // Codex CLI declares `apply_patch` as a plain function tool in
-                // some configurations (issue #37), but its handler only accepts
-                // `custom_tool_call` items, so treat it as custom by name. The
-                // argument field follows the declared schema (`patch` in recent
-                // Codex CLI, `input` in the historical JSON tool variant).
-                "function" if name == "apply_patch" => function_tool_string_field(tool)
-                    .unwrap_or_else(|| custom_argument_field(name).to_string()),
-                _ => return None,
-            };
-            Some((
-                name.to_string(),
-                CustomToolName {
-                    name: name.to_string(),
-                    argument_field,
-                },
-            ))
-        })
-        .collect()
+        }
+    }
+    map
+}
+
+fn custom_tool_entry(tool: &Value, denied: &HashSet<String>) -> Option<(String, CustomToolName)> {
+    let tool_type = tool.get("type").and_then(Value::as_str)?;
+    let name = tool.get("name").and_then(Value::as_str)?;
+    if denied.contains(name) {
+        return None;
+    }
+    let argument_field = match tool_type {
+        "custom" => custom_argument_field(name).to_string(),
+        // Codex CLI declares `apply_patch` as a plain function tool in some
+        // configurations (issue #37), but its handler only accepts
+        // `custom_tool_call` items, so treat it as custom by name. The argument
+        // field follows the declared schema (`patch` in recent Codex CLI,
+        // `input` in the historical JSON tool variant).
+        "function" if name == "apply_patch" => function_tool_string_field(tool)
+            .unwrap_or_else(|| custom_argument_field(name).to_string()),
+        _ => return None,
+    };
+    Some((
+        name.to_string(),
+        CustomToolName {
+            name: name.to_string(),
+            argument_field,
+        },
+    ))
 }
 
 pub(crate) fn chat_tool_names(tools: &[Value]) -> HashSet<String> {
@@ -552,50 +570,61 @@ fn convert_tools_with_denylist(tools: &[Value], denied: &HashSet<String>) -> Vec
                 let namespace = tool.get("name").and_then(Value::as_str).unwrap_or("");
                 if let Some(subs) = tool.get("tools").and_then(Value::as_array) {
                     for sub in subs {
-                        if sub.get("type").and_then(Value::as_str) == Some("function") {
-                            let name = sub
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .map(|name| chat_function_name_for_namespace_tool(namespace, name));
-                            if !tool_is_denied(sub, name.as_deref(), denied) {
-                                out.push(convert_tool_with_name(sub, name.as_deref()));
+                        match sub.get("type").and_then(Value::as_str) {
+                            Some("function") => {
+                                let name = sub.get("name").and_then(Value::as_str).map(|name| {
+                                    chat_function_name_for_namespace_tool(namespace, name)
+                                });
+                                if !tool_is_denied(sub, name.as_deref(), denied) {
+                                    out.push(convert_tool_with_name(sub, name.as_deref()));
+                                }
                             }
+                            Some("custom") => {
+                                if let Some(converted) = convert_custom_tool(sub, denied) {
+                                    out.push(converted);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
             }
             Some("custom") => {
-                let Some(name) = tool.get("name").and_then(Value::as_str) else {
-                    continue;
-                };
-                if denied.contains(name) {
-                    continue;
+                if let Some(converted) = convert_custom_tool(tool, denied) {
+                    out.push(converted);
                 }
-                let argument_field = custom_argument_field(name);
-                let description = tool
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Provide the raw custom tool input.");
-                out.push(json!({
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": description,
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                argument_field: {"type": "string"}
-                            },
-                            "required": [argument_field],
-                            "additionalProperties": false
-                        }
-                    }
-                }));
             }
             _ => {}
         }
     }
     out
+}
+
+fn convert_custom_tool(tool: &Value, denied: &HashSet<String>) -> Option<Value> {
+    let name = tool.get("name").and_then(Value::as_str)?;
+    if denied.contains(name) {
+        return None;
+    }
+    let argument_field = custom_argument_field(name);
+    let description = tool
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("Provide the raw custom tool input.");
+    Some(json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    argument_field: {"type": "string"}
+                },
+                "required": [argument_field],
+                "additionalProperties": false
+            }
+        }
+    }))
 }
 
 fn tool_is_denied(tool: &Value, override_name: Option<&str>, denied: &HashSet<String>) -> bool {
@@ -1672,6 +1701,114 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["spawn_agent", "wait_agent"]);
+    }
+
+    #[test]
+    fn test_namespace_custom_tool_uses_bare_name_and_round_trips_as_custom() {
+        let tools = vec![json!({
+            "type": "namespace",
+            "name": "functions",
+            "tools": [
+                {"type": "custom", "name": "exec", "description": "Run code"},
+                {"type": "function", "name": "wait", "parameters": {"type": "object"}}
+            ]
+        })];
+
+        let converted = convert_tools_with_denylist(&tools, &HashSet::new());
+        let names: Vec<&str> = converted
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert_eq!(names, ["exec", "functions-wait"]);
+        assert_eq!(
+            converted[0]["function"]["parameters"]["required"],
+            json!(["input"])
+        );
+
+        let namespace_tools = namespace_tool_map(&tools);
+        let custom_tools = custom_tool_map(&tools);
+        assert!(!namespace_tools.contains_key("exec"));
+        assert!(custom_tools.contains_key("exec"));
+
+        let chat = ChatResponse {
+            choices: vec![ChatChoice {
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![json!({
+                        "id": "call_exec",
+                        "type": "function",
+                        "function": {
+                            "name": "exec",
+                            "arguments": "{\"input\":\"ls\"}"
+                        }
+                    })]),
+                    tool_call_id: None,
+                    name: None,
+                },
+            }],
+            usage: None,
+        };
+        let (response, _) = from_chat_response_with_tool_maps(
+            "resp_exec".into(),
+            "model",
+            chat,
+            &namespace_tools,
+            &custom_tools,
+        );
+        assert_eq!(response.output[0]["type"], "custom_tool_call");
+        assert_eq!(response.output[0]["name"], "exec");
+        assert_eq!(response.output[0]["input"], "ls");
+        assert!(response.output[0].get("namespace").is_none());
+    }
+
+    #[test]
+    fn test_rejects_nested_custom_bare_name_collision() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let nested_custom = json!({
+            "type": "namespace",
+            "name": "functions",
+            "tools": [{"type": "custom", "name": "exec"}]
+        });
+        for conflicting in [
+            json!({"type": "custom", "name": "exec"}),
+            json!({"type": "function", "name": "exec"}),
+            json!({
+                "type": "namespace",
+                "name": "other",
+                "tools": [{"type": "custom", "name": "exec"}]
+            }),
+        ] {
+            let tools = vec![conflicting, nested_custom.clone()];
+
+            let error = validate_unique_chat_tool_names(&tools).unwrap_err();
+            assert!(error.contains("exec"));
+        }
+    }
+
+    #[test]
+    fn test_denylist_filters_nested_custom_from_tools_and_reverse_map() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tools = vec![json!({
+            "type": "namespace",
+            "name": "functions",
+            "tools": [
+                {"type": "custom", "name": "exec"},
+                {"type": "function", "name": "wait"}
+            ]
+        })];
+        std::env::set_var("CODEX_RELAY_TOOL_DENYLIST", "exec");
+
+        let converted = convert_tools(&tools);
+        let names: Vec<&str> = converted
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert_eq!(names, ["functions-wait"]);
+        assert!(!custom_tool_map(&tools).contains_key("exec"));
+
+        std::env::remove_var("CODEX_RELAY_TOOL_DENYLIST");
     }
 
     #[test]

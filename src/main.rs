@@ -788,11 +788,8 @@ async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes
     handle_responses_inner(state, req).await
 }
 
-async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Response {
+async fn handle_responses_inner(state: AppState, mut req: ResponsesRequest) -> Response {
     if let Err(message) = translate::validate_unique_chat_tool_names(&req.tools) {
-        return (StatusCode::UNPROCESSABLE_ENTITY, message).into_response();
-    }
-    if let Err(message) = validate_agent_message_content(&req.input) {
         return (StatusCode::UNPROCESSABLE_ENTITY, message).into_response();
     }
     let mut history = req
@@ -800,6 +797,9 @@ async fn handle_responses_inner(state: AppState, req: ResponsesRequest) -> Respo
         .as_deref()
         .map(|id| state.sessions.get_history(id))
         .unwrap_or_default();
+    if let Err(message) = normalize_agent_message_content(&mut req.input, &history) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, message).into_response();
+    }
     if should_isolate_spawn_child_request(&req, &history) {
         debug!("isolating spawned child request from parent response history");
         history.clear();
@@ -855,31 +855,7 @@ fn should_isolate_spawn_child_request(req: &ResponsesRequest, history: &[ChatMes
     let Some(input) = isolated_child_input(&req.input) else {
         return false;
     };
-    let mut call_id_counts = std::collections::HashMap::new();
-    for call_id in history
-        .iter()
-        .flat_map(|msg| msg.tool_calls.as_deref().unwrap_or(&[]))
-        .filter_map(|call| call.get("id").and_then(serde_json::Value::as_str))
-    {
-        *call_id_counts.entry(call_id).or_insert(0usize) += 1;
-    }
-    let completed_tool_calls: std::collections::HashSet<&str> = history
-        .iter()
-        .filter_map(|msg| msg.tool_call_id.as_deref())
-        .collect();
-    let pending_spawns = history
-        .iter()
-        .flat_map(|msg| msg.tool_calls.as_deref().unwrap_or(&[]))
-        .filter(|call| {
-            let call_id = call.get("id").and_then(serde_json::Value::as_str);
-            call_id.is_none_or(|id| {
-                id.is_empty()
-                    || call_id_counts.get(id) != Some(&1)
-                    || !completed_tool_calls.contains(id)
-            })
-        })
-        .filter_map(parse_spawn_agent_call)
-        .collect::<Vec<_>>();
+    let pending_spawns = pending_spawn_agent_calls(history);
 
     if let Some(recipient) = input.recipient.as_deref() {
         return pending_spawns
@@ -895,6 +871,34 @@ fn should_isolate_spawn_child_request(req: &ResponsesRequest, history: &[ChatMes
     }
 
     pending_spawns.len() == 1 && pending_spawns[0].is_v2_encrypted_candidate()
+}
+
+fn pending_spawn_agent_calls(history: &[ChatMessage]) -> Vec<SpawnAgentCall> {
+    let mut call_id_counts = std::collections::HashMap::new();
+    for call_id in history
+        .iter()
+        .flat_map(|msg| msg.tool_calls.as_deref().unwrap_or(&[]))
+        .filter_map(|call| call.get("id").and_then(serde_json::Value::as_str))
+    {
+        *call_id_counts.entry(call_id).or_insert(0usize) += 1;
+    }
+    let completed_tool_calls: std::collections::HashSet<&str> = history
+        .iter()
+        .filter_map(|msg| msg.tool_call_id.as_deref())
+        .collect();
+    history
+        .iter()
+        .flat_map(|msg| msg.tool_calls.as_deref().unwrap_or(&[]))
+        .filter(|call| {
+            let call_id = call.get("id").and_then(serde_json::Value::as_str);
+            call_id.is_none_or(|id| {
+                id.is_empty()
+                    || call_id_counts.get(id) != Some(&1)
+                    || !completed_tool_calls.contains(id)
+            })
+        })
+        .filter_map(parse_spawn_agent_call)
+        .collect()
 }
 
 struct IsolatedChildInput {
@@ -966,20 +970,22 @@ fn isolated_child_input(input: &ResponsesInput) -> Option<IsolatedChildInput> {
     }
 }
 
-fn validate_agent_message_content(input: &ResponsesInput) -> Result<(), &'static str> {
+fn normalize_agent_message_content(
+    input: &mut ResponsesInput,
+    history: &[ChatMessage],
+) -> Result<(), &'static str> {
     let ResponsesInput::Messages(items) = input else {
         return Ok(());
     };
+    let pending_spawns = pending_spawn_agent_calls(history);
     for item in items {
         if item.get("type").and_then(serde_json::Value::as_str) != Some("agent_message") {
             continue;
         }
-        let content = item.get("content").unwrap_or(&serde_json::Value::Null);
-        if contains_encrypted_content(content) {
-            return Err(
-                "encrypted agent_message content cannot be forwarded to a Chat Completions upstream",
-            );
+        if contains_encrypted_content(item.get("content").unwrap_or(&serde_json::Value::Null)) {
+            normalize_legacy_encrypted_agent_message(item, &pending_spawns)?;
         }
+        let content = item.get("content").unwrap_or(&serde_json::Value::Null);
         let Some(parts) = content.as_array() else {
             return Err("agent_message content must be an array of plaintext text parts");
         };
@@ -995,6 +1001,75 @@ fn validate_agent_message_content(input: &ResponsesInput) -> Result<(), &'static
             })
         {
             return Err("agent_message content must contain only plaintext text parts");
+        }
+    }
+    Ok(())
+}
+
+/// Recover the legacy non-OpenAI V2 shape only when session history proves the
+/// wrapper contains the exact plaintext task. Never infer plaintext from the
+/// encrypted value's format: genuine provider ciphertext must remain rejected.
+fn normalize_legacy_encrypted_agent_message(
+    item: &mut serde_json::Value,
+    pending_spawns: &[SpawnAgentCall],
+) -> Result<(), &'static str> {
+    let recipient = item
+        .get("recipient")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(
+            "encrypted agent_message content cannot be forwarded to a Chat Completions upstream",
+        )?;
+    let parts = item
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(
+            "encrypted agent_message content cannot be forwarded to a Chat Completions upstream",
+        )?;
+    let encrypted_parts = parts
+        .iter()
+        .filter(|part| {
+            part.get("type").and_then(serde_json::Value::as_str) == Some("encrypted_content")
+        })
+        .collect::<Vec<_>>();
+    if encrypted_parts.len() != 1
+        || parts.iter().any(|part| {
+            !matches!(
+                part.get("type").and_then(serde_json::Value::as_str),
+                Some("input_text" | "text" | "encrypted_content")
+            )
+        })
+    {
+        return Err(
+            "encrypted agent_message content cannot be forwarded to a Chat Completions upstream",
+        );
+    }
+    let wrapped_text = encrypted_parts[0]
+        .get("encrypted_content")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(
+            "encrypted agent_message content cannot be forwarded to a Chat Completions upstream",
+        )?
+        .to_string();
+    let matching_spawns = pending_spawns
+        .iter()
+        .filter(|spawn| {
+            spawn.matches_recipient(recipient)
+                && spawn.message.as_deref() == Some(wrapped_text.as_str())
+        })
+        .count();
+    if matching_spawns != 1 {
+        return Err(
+            "encrypted agent_message content cannot be forwarded to a Chat Completions upstream",
+        );
+    }
+
+    let parts = item
+        .get_mut("content")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("agent_message content checked as array");
+    for part in parts {
+        if part.get("type").and_then(serde_json::Value::as_str) == Some("encrypted_content") {
+            *part = serde_json::json!({"type": "input_text", "text": &wrapped_text});
         }
     }
     Ok(())
@@ -1445,26 +1520,144 @@ mod tests {
                 "payload": {"type": "encrypted_content", "encrypted_content": "opaque-secret"}
             }]),
         ] {
-            let input = ResponsesInput::Messages(vec![json!({
+            let mut input = ResponsesInput::Messages(vec![json!({
                 "type": "agent_message",
                 "recipient": "/root/worker",
                 "content": content
             })]);
-            assert!(validate_agent_message_content(&input).is_err());
+            assert!(normalize_agent_message_content(&mut input, &[]).is_err());
             assert!(isolated_child_input(&input).is_none());
         }
     }
 
     #[test]
     fn test_opaque_agent_message_is_not_treated_as_plaintext_child() {
-        let input = ResponsesInput::Messages(vec![json!({
+        let mut input = ResponsesInput::Messages(vec![json!({
             "type": "agent_message",
             "recipient": "/root/worker",
             "content": [{"type": "unknown", "payload": "opaque"}]
         })]);
 
-        assert!(validate_agent_message_content(&input).is_err());
+        assert!(normalize_agent_message_content(&mut input, &[]).is_err());
         assert!(isolated_child_input(&input).is_none());
+    }
+
+    #[test]
+    fn test_legacy_encrypted_agent_message_is_normalized_on_exact_pending_spawn_match() {
+        let task = "请列出当前目录下的文件。";
+        let mut input = ResponsesInput::Messages(vec![json!({
+            "type": "agent_message",
+            "recipient": "/root/list_files",
+            "content": [
+                {"type": "input_text", "text": "Message Type: NEW_TASK\nPayload:\n"},
+                {"type": "encrypted_content", "encrypted_content": task}
+            ]
+        })]);
+        let history = vec![ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![json!({
+                "id": "call_spawn",
+                "type": "function",
+                "function": {
+                    "name": "collaboration-spawn_agent",
+                    "arguments": json!({
+                        "fork_turns": "none",
+                        "message": task,
+                        "task_name": "list_files"
+                    }).to_string()
+                }
+            })]),
+            tool_call_id: None,
+            name: None,
+        }];
+
+        assert!(normalize_agent_message_content(&mut input, &history).is_ok());
+        let ResponsesInput::Messages(items) = &input else {
+            panic!("message input");
+        };
+        assert_eq!(
+            items[0]["content"][1],
+            json!({"type": "input_text", "text": task})
+        );
+        assert!(isolated_child_input(&input).is_some());
+    }
+
+    #[test]
+    fn test_legacy_encrypted_agent_message_rejects_ambiguous_pending_spawn_match() {
+        let task = "same task";
+        let mut input = ResponsesInput::Messages(vec![json!({
+            "type": "agent_message",
+            "recipient": "/root/worker",
+            "content": [{"type": "encrypted_content", "encrypted_content": task}]
+        })]);
+        let history = vec![ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(
+                ["call_a", "call_b"]
+                    .into_iter()
+                    .map(|call_id| {
+                        json!({
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": "collaboration-spawn_agent",
+                                "arguments": json!({
+                                    "message": task,
+                                    "task_name": "worker"
+                                }).to_string()
+                            }
+                        })
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+            name: None,
+        }];
+
+        assert!(normalize_agent_message_content(&mut input, &history).is_err());
+        assert!(contains_encrypted_content(match &input {
+            ResponsesInput::Messages(items) => &items[0]["content"],
+            ResponsesInput::Text(_) => unreachable!(),
+        }));
+    }
+
+    #[test]
+    fn test_legacy_encrypted_agent_message_requires_both_recipient_and_message_match() {
+        let history = vec![ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![json!({
+                "id": "call_spawn",
+                "type": "function",
+                "function": {
+                    "name": "collaboration-spawn_agent",
+                    "arguments": "{\"task_name\":\"worker\",\"message\":\"expected task\"}"
+                }
+            })]),
+            tool_call_id: None,
+            name: None,
+        }];
+
+        for (recipient, wrapped_text) in [
+            ("/root/other-worker", "expected task"),
+            ("/root/worker", "gAAAAA-opaque-ciphertext"),
+        ] {
+            let mut input = ResponsesInput::Messages(vec![json!({
+                "type": "agent_message",
+                "recipient": recipient,
+                "content": [{
+                    "type": "encrypted_content",
+                    "encrypted_content": wrapped_text
+                }]
+            })]);
+
+            assert!(normalize_agent_message_content(&mut input, &history).is_err());
+        }
     }
 
     #[test]

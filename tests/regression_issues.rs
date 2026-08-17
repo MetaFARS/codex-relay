@@ -2163,6 +2163,98 @@ async fn issue_12_spawn_agent_child_context_should_not_replay_parent_history() {
 }
 
 #[tokio::test]
+async fn issue_60_legacy_encrypted_agent_message_uses_matching_spawn_plaintext() {
+    let child_task = "请列出当前目录（/home/qcnhy）下的文件，返回文件列表即可。";
+    let tool_args = json!({
+        "fork_turns": "none",
+        "message": child_task,
+        "task_name": "list_files",
+    })
+    .to_string();
+    let spawn_agent_sse = sse_from_chunks(vec![
+        json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_spawn_list_files",
+                        "function": {
+                            "name": "collaboration-spawn_agent",
+                            "arguments": tool_args
+                        }
+                    }]
+                }
+            }]
+        }),
+        json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}),
+    ]);
+    let collaboration_tools = json!({
+        "type": "namespace",
+        "name": "collaboration",
+        "tools": [{"type": "function", "name": "spawn_agent"}]
+    });
+
+    let (upstream_port, bodies) =
+        spawn_mock_upstream_with_responses(vec![spawn_agent_sse, default_ok_sse()]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+    let parent_completed = post_stream_completed(
+        &relay,
+        json!({
+            "model": "mock-model",
+            "input": "Ask a subagent to list files.",
+            "tools": [collaboration_tools.clone()],
+            "stream": true
+        }),
+    )
+    .await;
+    let parent_response_id = parent_completed["response"]["id"]
+        .as_str()
+        .expect("parent response id");
+
+    let _child_completed = post_stream_completed(
+        &relay,
+        json!({
+            "model": "mock-model",
+            "previous_response_id": parent_response_id,
+            "input": [{
+                "type": "agent_message",
+                "id": "amsg_list_files",
+                "author": "/root",
+                "recipient": "/root/list_files",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Message Type: NEW_TASK\nTask name: /root/list_files\nSender: /root\nPayload:\n"
+                    },
+                    {"type": "encrypted_content", "encrypted_content": child_task}
+                ]
+            }],
+            "tools": [collaboration_tools],
+            "stream": true
+        }),
+    )
+    .await;
+
+    let request_bodies = bodies.lock().unwrap();
+    assert_eq!(request_bodies.len(), 2, "parent and child upstream calls");
+    let child_messages = request_bodies[1]["messages"]
+        .as_array()
+        .expect("child upstream messages");
+    assert_eq!(child_messages.len(), 1, "parent history must be isolated");
+    assert_eq!(child_messages[0]["role"], "user");
+    assert_eq!(
+        child_messages[0]["content"],
+        format!(
+            "Message Type: NEW_TASK\nTask name: /root/list_files\nSender: /root\nPayload:\n{child_task}"
+        )
+    );
+    assert!(
+        !child_messages[0].to_string().contains("encrypted_content"),
+        "encrypted wrapper must not reach the Chat Completions upstream"
+    );
+}
+
+#[tokio::test]
 async fn issue_24_v2_encrypted_spawn_child_context_is_isolated() {
     let child_task = "Inspect the repository and report the risky files.";
     let parent_prompt = "Ask a subagent to inspect the repository.";

@@ -73,19 +73,25 @@ pub fn to_chat_request(
         .as_ref()
         .filter(|text| !text.trim().is_empty())
         .or_else(|| req.system.as_ref().filter(|text| !text.trim().is_empty()));
+
+    let request_has_system = system_text.is_some();
+
     if let Some(system) = system_text {
-        if messages.is_empty() || messages[0].role != "system" {
-            messages.insert(
-                0,
-                ChatMessage {
-                    role: "system".into(),
-                    content: Some(Value::String(system.clone())),
-                    reasoning_content: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                },
-            );
+        let current_system = ChatMessage {
+            role: "system".into(),
+            content: Some(Value::String(system.clone())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+
+        // Rebuild the request-scoped base prompt from the current request.
+        // Do not reuse a previously merged runtime system prompt from history.
+        if !messages.is_empty() && messages[0].role == "system" {
+            messages[0] = current_system;
+        } else {
+            messages.insert(0, current_system);
         }
     }
 
@@ -262,7 +268,16 @@ pub fn to_chat_request(
                             // Chat Completions API.
                             if msg.role == "system" {
                                 if !messages.is_empty() && messages[0].role == "system" {
-                                    messages[0] = msg; // replace existing system prompt
+                                    if request_has_system {
+                                        // Codex 0.153.x sends model/base instructions in the
+                                        // top-level `instructions` field and request-scoped runtime
+                                        // instructions as developer messages. Both must survive.
+                                        merge_system_message(&mut messages[0], msg);
+                                    } else {
+                                        // Keep historical relay behavior for callers that did not
+                                        // provide request-level instructions/system.
+                                        messages[0] = msg;
+                                    }
                                 } else {
                                     messages.insert(0, msg);
                                 }
@@ -913,6 +928,22 @@ fn is_contentless_response_message(item: &Value) -> bool {
     let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
     matches!(role, "user" | "system" | "developer")
         && is_content_value_contentless(item.get("content"))
+}
+
+fn merge_system_message(existing: &mut ChatMessage, incoming: ChatMessage) {
+    match (&mut existing.content, incoming.content) {
+        (Some(Value::String(base)), Some(Value::String(runtime))) => {
+            if !base.trim().is_empty() && !runtime.trim().is_empty() {
+                base.push_str("\n\n");
+            }
+            base.push_str(&runtime);
+        }
+        // Preserve the relay's existing behavior for unusual non-text
+        // system content instead of inventing a new multimodal merge rule.
+        (slot, incoming_content) => {
+            *slot = incoming_content;
+        }
+    }
 }
 
 fn response_message_to_chat(item: &Value) -> ChatMessage {
@@ -2379,16 +2410,74 @@ mod tests {
     /// When both `instructions` and a developer input item provide a system
     /// prompt, the later one (from input items) wins.
     #[test]
-    fn test_system_from_input_replaces_instructions() {
+    fn test_developer_input_merges_with_instructions() {
         let sessions = SessionStore::new();
         let mut req = base_req(ResponsesInput::Messages(vec![
             json!({"type": "message", "role": "user", "content": "hi"}),
-            json!({"type": "message", "role": "developer", "content": "override"}),
+            json!({"type": "message", "role": "developer", "content": "runtime"}),
         ]));
-        req.instructions = Some("original".into());
+        req.instructions = Some("base".into());
+
         let chat = to_chat_request(&req, vec![], &sessions);
+
         assert_eq!(chat.messages[0].role, "system");
-        assert_eq!(chat.messages[0].text_content(), "override");
+        assert_eq!(chat.messages[0].text_content(), "base\n\nruntime");
+    }
+
+    #[test]
+    fn test_multipart_developer_merges_with_instructions() {
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Messages(vec![
+            json!({
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    {"type": "input_text", "text": "<skills>rules</skills>"},
+                    {"type": "input_text", "text": "<permissions>workspace</permissions>"}
+                ]
+            }),
+            json!({"type": "message", "role": "user", "content": "hi"}),
+        ]));
+        req.instructions = Some("local coder base".into());
+
+        let chat = to_chat_request(&req, vec![], &sessions);
+
+        assert_eq!(
+            chat.messages[0].text_content(),
+            "local coder base\n\n<skills>rules</skills><permissions>workspace</permissions>"
+        );
+    }
+
+    #[test]
+    fn test_current_instructions_refresh_history_before_runtime_merge() {
+        let sessions = SessionStore::new();
+
+        let history = vec![ChatMessage {
+            role: "system".into(),
+            content: Some(Value::String("old base\n\nold runtime".into())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+
+        let mut req = base_req(ResponsesInput::Messages(vec![
+            json!({
+                "type": "message",
+                "role": "developer",
+                "content": "current runtime"
+            }),
+            json!({"type": "message", "role": "user", "content": "hi"}),
+        ]));
+
+        req.instructions = Some("current base".into());
+
+        let chat = to_chat_request(&req, history, &sessions);
+
+        assert_eq!(
+            chat.messages[0].text_content(),
+            "current base\n\ncurrent runtime"
+        );
     }
 
     // ── Model name mapping tests (#4) ─────────────────────────────────

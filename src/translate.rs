@@ -538,13 +538,49 @@ fn declared_function_name(tool: &Value) -> Option<&str> {
 
 /// If a Responses API function tool takes a single string parameter, return
 /// that parameter's name.
-fn function_tool_string_field(tool: &Value) -> Option<String> {
-    let properties = tool.get("parameters")?.get("properties")?.as_object()?;
+fn string_field_from_parameters(parameters: &Value) -> Option<String> {
+    let properties = parameters.get("properties")?.as_object()?;
     if properties.len() != 1 {
         return None;
     }
+
     let (field, schema) = properties.iter().next()?;
     (schema.get("type").and_then(Value::as_str) == Some("string")).then(|| field.clone())
+}
+
+fn function_tool_string_field(tool: &Value) -> Option<String> {
+    let parameters = tool.get("parameters").or_else(|| {
+        tool.get("function")
+            .and_then(|function| function.get("parameters"))
+    })?;
+
+    string_field_from_parameters(parameters)
+}
+
+fn apply_patch_chat_description(argument_field: &str) -> String {
+    format!(
+        "Apply a Codex patch. Use this as a normal function tool and pass the complete \
+patch text in the `{argument_field}` string argument.
+
+Syntax:
+
+*** Begin Patch
+*** Update File: path/to/file
+@@
+ context line
+-old line
++new line
+*** End Patch
+
+Rule:
+
+First/final lines are exactly `*** Begin Patch` / `*** End Patch`.
+Use `*** Add File:` / `*** Delete File:` / `*** Update File:` to create/delete/modify a file.
+Use relative path against the workspace.
+The update-hunk header must be exactly `@@`.
+Update-hunk lines must start with ` ` (for context lines), `-` (for old lines), or `+` (for new lines). \
+Omit context lines when changed lines uniquely locate the edit."
+    )
 }
 
 fn custom_argument_field(name: &str) -> &'static str {
@@ -621,10 +657,14 @@ fn convert_custom_tool(tool: &Value, denied: &HashSet<String>) -> Option<Value> 
         return None;
     }
     let argument_field = custom_argument_field(name);
-    let description = tool
-        .get("description")
-        .and_then(Value::as_str)
-        .unwrap_or("Provide the raw custom tool input.");
+    let description = if name == "apply_patch" {
+        apply_patch_chat_description(argument_field)
+    } else {
+        tool.get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("Provide the raw custom tool input.")
+            .to_string()
+    };
     Some(json!({
         "type": "function",
         "function": {
@@ -676,9 +716,20 @@ fn convert_tool_with_name(tool: &Value, override_name: Option<&str>) -> Value {
     // Already in Chat Completions format if it has a "function" sub-object.
     if obj.contains_key("function") {
         let mut tool = tool.clone();
-        if let Some(name) = override_name {
-            if let Some(func) = tool.get_mut("function").and_then(Value::as_object_mut) {
+        if let Some(func) = tool.get_mut("function").and_then(Value::as_object_mut) {
+            if let Some(name) = override_name {
                 func.insert("name".into(), Value::String(name.to_string()));
+            }
+            let effective_name = func.get("name").and_then(Value::as_str);
+            if effective_name == Some("apply_patch") {
+                let argument_field = func
+                    .get("parameters")
+                    .and_then(string_field_from_parameters)
+                    .unwrap_or_else(|| custom_argument_field("apply_patch").to_string());
+                func.insert(
+                    "description".into(),
+                    Value::String(apply_patch_chat_description(&argument_field)),
+                );
             }
         }
         return tool;
@@ -691,7 +742,15 @@ fn convert_tool_with_name(tool: &Value, override_name: Option<&str>) -> Value {
         } else if let Some(v) = obj.get("name") {
             func.insert("name".into(), v.clone());
         }
-        if let Some(v) = obj.get("description") {
+        let effective_name = override_name.or_else(|| obj.get("name").and_then(Value::as_str));
+        if effective_name == Some("apply_patch") {
+            let argument_field = function_tool_string_field(tool)
+                .unwrap_or_else(|| custom_argument_field("apply_patch").to_string());
+            func.insert(
+                "description".into(),
+                Value::String(apply_patch_chat_description(&argument_field)),
+            );
+        } else if let Some(v) = obj.get("description") {
             func.insert("description".into(), v.clone());
         }
         if let Some(v) = obj.get("parameters") {

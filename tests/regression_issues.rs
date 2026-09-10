@@ -151,6 +151,17 @@ fn issue_37_custom_apply_patch_round_trips_in_blocking_translation() {
         json!(["patch"])
     );
 
+    let description = chat_req.tools[0]["function"]["description"]
+        .as_str()
+        .unwrap();
+
+    assert!(description.contains("normal function tool"));
+    assert!(description.contains("`patch`"));
+    assert!(description.contains("*** Begin Patch"));
+    assert!(description.contains("*** End Patch"));
+    assert!(!description.to_ascii_lowercase().contains("freeform"));
+    assert!(!description.to_ascii_lowercase().contains("do not wrap"));
+
     let patch = "*** Begin Patch\n*** Update File: test.txt\n@@\n-old\n+new\n*** End Patch";
     let chat = ChatResponse {
         choices: vec![ChatChoice {
@@ -216,6 +227,17 @@ fn issue_37_function_declared_apply_patch_emits_custom_tool_call() {
         chat_req.tools[0]["function"]["parameters"]["required"],
         json!(["patch"])
     );
+
+    let description = chat_req.tools[0]["function"]["description"]
+        .as_str()
+        .unwrap();
+
+    assert!(description.contains("normal function tool"));
+    assert!(description.contains("`patch`"));
+    assert!(description.contains("*** Begin Patch"));
+    assert!(description.contains("*** End Patch"));
+    assert!(!description.to_ascii_lowercase().contains("freeform"));
+    assert!(!description.to_ascii_lowercase().contains("do not wrap"));
 
     let patch = "*** Begin Patch\n*** Update File: test.txt\n@@\n-old\n+new\n*** End Patch";
     let chat = ChatResponse {
@@ -329,6 +351,11 @@ fn issue_37_function_declared_apply_patch_respects_input_argument_field() {
     let args = assistant.tool_calls.as_ref().unwrap()[0]["function"]["arguments"]
         .as_str()
         .unwrap();
+    let description = chat_req.tools[0]["function"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(description.contains("`input`"));
+    assert!(!description.to_ascii_lowercase().contains("freeform"));
     assert_eq!(
         serde_json::from_str::<Value>(args).unwrap(),
         json!({"input": patch})

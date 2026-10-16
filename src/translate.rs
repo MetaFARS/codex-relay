@@ -1,8 +1,5 @@
 use serde_json::{json, Value};
-use std::{
-    collections::{HashMap, HashSet},
-    hash::{Hash, Hasher},
-};
+use std::collections::{HashMap, HashSet};
 
 use crate::{session::SessionStore, types::*};
 
@@ -21,208 +18,6 @@ pub struct CustomToolName {
 }
 
 pub type CustomToolMap = HashMap<String, CustomToolName>;
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TranslateOptions {
-    pub opencode_go_compat: bool,
-}
-
-/// Derive a stable fallback session identity when the Responses client does
-/// not provide x-opencode-session. The relay binds this identity to its
-/// response IDs for subsequent previous_response_id requests.
-pub fn opencode_session_id_for_request(req: &ResponsesRequest) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    let fingerprint = match &req.input {
-        ResponsesInput::Text(text) => Some(text.clone()),
-        ResponsesInput::Messages(items) => items.iter().find_map(|item| {
-            (item.get("type").and_then(Value::as_str) == Some("message"))
-                .then(|| serde_json::to_string(item).ok())
-                .flatten()
-        }),
-    };
-
-    if let Some(fingerprint) = fingerprint {
-        fingerprint.hash(&mut hasher);
-        format!("codex-relay-{:016x}", hasher.finish())
-    } else {
-        format!("codex-relay-{}", uuid::Uuid::new_v4().simple())
-    }
-}
-
-/// Normalize a Responses payload before forwarding it to OpenCode Go's
-/// native Responses endpoint. Returns (orphan outputs normalized, schema refs
-/// stripped, unsupported tool fields stripped).
-pub fn normalize_opencode_go_responses_payload(payload: &mut Value) -> (usize, usize, usize) {
-    let normalized_outputs = payload
-        .get_mut("input")
-        .and_then(Value::as_array_mut)
-        .map(|items| {
-            let mut changed = 0;
-            for item in items {
-                let normalized = normalize_opencode_go_input_item(item);
-                if normalized != *item {
-                    changed += 1;
-                    *item = normalized;
-                }
-            }
-            changed
-        })
-        .unwrap_or(0);
-    let mut stripped_fields = payload
-        .get_mut("tools")
-        .and_then(Value::as_array_mut)
-        .map(normalize_opencode_go_tools)
-        .unwrap_or(0);
-    let stripped_refs = payload
-        .get_mut("tools")
-        .and_then(Value::as_array_mut)
-        .map(|tools| strip_tool_schema_refs(tools))
-        .unwrap_or(0);
-    stripped_fields += payload
-        .get_mut("tools")
-        .and_then(Value::as_array_mut)
-        .map(|tools| strip_opencode_go_unsupported_tool_fields(tools))
-        .unwrap_or(0);
-    if payload
-        .get("reasoning")
-        .and_then(Value::as_object)
-        .and_then(|reasoning| reasoning.get("effort"))
-        .and_then(Value::as_str)
-        == Some("none")
-    {
-        payload
-            .as_object_mut()
-            .and_then(|object| object.remove("reasoning"));
-        stripped_fields += 1;
-    }
-    (normalized_outputs, stripped_refs, stripped_fields)
-}
-
-fn normalize_opencode_go_tools(tools: &mut Vec<Value>) -> usize {
-    let original = std::mem::take(tools);
-    let mut changed = 0;
-    for tool in original {
-        match tool.get("type").and_then(Value::as_str).unwrap_or("") {
-            "function" => {
-                let mut tool = tool;
-                bound_native_tool_name(&mut tool);
-                tools.push(tool);
-            }
-            "web_search_preview" => tools.push(tool),
-            "custom" => {
-                if let Some(function) = custom_tool_as_function(tool, None) {
-                    tools.push(function);
-                    changed += 1;
-                }
-            }
-            "namespace" => {
-                let namespace = tool.get("name").and_then(Value::as_str).unwrap_or("");
-                for child in tool
-                    .get("tools")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
-                    match child.get("type").and_then(Value::as_str).unwrap_or("") {
-                        "function" => {
-                            let mut function = child.clone();
-                            prefix_native_tool_name(&mut function, namespace);
-                            tools.push(function);
-                            changed += 1;
-                        }
-                        "custom" => {
-                            if let Some(function) =
-                                custom_tool_as_function(child.clone(), Some(namespace))
-                            {
-                                tools.push(function);
-                                changed += 1;
-                            }
-                        }
-                        _ => changed += 1,
-                    }
-                }
-            }
-            _ => changed += 1,
-        }
-    }
-    changed
-}
-
-fn custom_tool_as_function(mut tool: Value, namespace: Option<&str>) -> Option<Value> {
-    let object = tool.as_object_mut()?;
-    let original_name = object.get("name")?.as_str()?.to_owned();
-    let argument_field = custom_argument_field(&original_name);
-    let full_name = namespace.map_or(original_name.clone(), |namespace| {
-        chat_function_name_for_namespace_tool(namespace, &original_name)
-    });
-    object.insert("type".into(), Value::String("function".into()));
-    object.insert(
-        "name".into(),
-        Value::String(bound_native_tool_name_value(&full_name)),
-    );
-    object.remove("format");
-    object.remove("input_format");
-    if !object.contains_key("parameters") {
-        object.insert(
-            "parameters".into(),
-            json!({
-                "type": "object",
-                "properties": {argument_field: {"type": "string"}},
-                "required": [argument_field]
-            }),
-        );
-    }
-    Some(tool)
-}
-
-fn prefix_native_tool_name(tool: &mut Value, namespace: &str) {
-    let Some(object) = tool.as_object_mut() else {
-        return;
-    };
-    let Some(name) = object.get("name").and_then(Value::as_str) else {
-        return;
-    };
-    object.insert(
-        "name".into(),
-        Value::String(bound_native_tool_name_value(
-            &chat_function_name_for_namespace_tool(namespace, name),
-        )),
-    );
-}
-
-fn bound_native_tool_name(tool: &mut Value) {
-    let Some(object) = tool.as_object_mut() else {
-        return;
-    };
-    let Some(name) = object.get("name").and_then(Value::as_str) else {
-        return;
-    };
-    object.insert(
-        "name".into(),
-        Value::String(bound_native_tool_name_value(name)),
-    );
-}
-
-fn bound_native_tool_name_value(name: &str) -> String {
-    const MAX_NAME_BYTES: usize = 64;
-    if name.len() <= MAX_NAME_BYTES {
-        return name.to_owned();
-    }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    name.hash(&mut hasher);
-    let suffix = format!("-{:08x}", hasher.finish() as u32);
-    let prefix_len = MAX_NAME_BYTES - suffix.len();
-    let prefix: String = name.chars().take(prefix_len).collect();
-    format!("{prefix}{suffix}")
-}
-
-fn strip_opencode_go_unsupported_tool_fields(tools: &mut [Value]) -> usize {
-    tools
-        .iter_mut()
-        .filter(|tool| tool.get("type").and_then(Value::as_str) != Some("web_search_preview"))
-        .filter_map(|tool| tool.as_object_mut()?.remove("search_content_types"))
-        .count()
-}
 
 /// Reject tool declarations that collapse to the same Chat Completions name.
 /// The `namespace-name` encoding is not reversible on its own; silently
@@ -252,16 +47,6 @@ pub fn to_chat_request(
     req: &ResponsesRequest,
     history: Vec<ChatMessage>,
     sessions: &SessionStore,
-) -> ChatRequest {
-    to_chat_request_with_options(req, history, sessions, TranslateOptions::default())
-}
-
-/// Convert a Responses API request with optional provider-specific workarounds.
-pub fn to_chat_request_with_options(
-    req: &ResponsesRequest,
-    history: Vec<ChatMessage>,
-    sessions: &SessionStore,
-    options: TranslateOptions,
 ) -> ChatRequest {
     let mut messages = history;
 
@@ -321,12 +106,6 @@ pub fn to_chat_request_with_options(
             messages.push(msg);
         }
         ResponsesInput::Messages(items) => {
-            let normalized_items: Vec<Value> = if options.opencode_go_compat {
-                items.iter().map(normalize_opencode_go_input_item).collect()
-            } else {
-                items.clone()
-            };
-            let items = &normalized_items;
             // Request-scoped custom tool map so replayed custom_tool_call items
             // are wrapped with the same argument field the tool declared.
             let custom_tools = custom_tool_map(&req.tools);
@@ -544,81 +323,10 @@ pub fn to_chat_request_with_options(
     }
 }
 
-fn normalize_opencode_go_input_item(item: &Value) -> Value {
-    if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
-        let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
-        let argument_field = custom_argument_field(name);
-        let input = item
-            .get("input")
-            .cloned()
-            .unwrap_or_else(|| Value::String(String::new()));
-        return json!({
-            "type": "function_call",
-            "call_id": item.get("call_id").cloned().unwrap_or(Value::Null),
-            "name": name,
-            "arguments": json!({argument_field: input}).to_string(),
-        });
-    }
-    if item.get("type").and_then(Value::as_str) == Some("custom_tool_call_output") {
-        let mut normalized = item.clone();
-        if let Some(object) = normalized.as_object_mut() {
-            object.insert("type".into(), Value::String("function_call_output".into()));
-        }
-        return normalized;
-    }
-    let is_orphan_output = item.get("type").and_then(Value::as_str) == Some("function_call_output")
-        && item
-            .get("call_id")
-            .and_then(Value::as_str)
-            .is_none_or(str::is_empty);
-    if !is_orphan_output {
-        return item.clone();
-    }
-
-    let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
-    let namespace = item
-        .get("namespace")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty());
-    let label = namespace.map_or_else(|| name.to_string(), |ns| format!("{ns}/{name}"));
-    let output = response_output_text(item.get("output"));
-    json!({
-        "type": "message",
-        "role": "developer",
-        "content": format!("[{label} output]\n{output}"),
-    })
-}
-
-fn response_output_text(value: Option<&Value>) -> String {
-    match value {
-        Some(Value::String(text)) => text.clone(),
-        Some(value) => value.to_string(),
-        None => String::new(),
-    }
-}
-
-/// Remove `$ref` schema nodes from function tools for providers that reject
-/// recursive or otherwise unsupported JSON Schema references.
-pub fn strip_tool_schema_refs(tools: &mut [Value]) -> usize {
-    tools.iter_mut().map(strip_schema_refs).sum()
-}
-
-fn strip_schema_refs(value: &mut Value) -> usize {
-    match value {
-        Value::Object(object) if object.contains_key("$ref") => {
-            *value = Value::Object(serde_json::Map::new());
-            1
-        }
-        Value::Object(object) => object.values_mut().map(strip_schema_refs).sum(),
-        Value::Array(items) => items.iter_mut().map(strip_schema_refs).sum(),
-        _ => 0,
-    }
-}
-
 /// Map model names via `CODEX_RELAY_MODEL_MAP` env var.
 /// Format: `source-model:target-model,source2:target2`
 /// Example: `CODEX_RELAY_MODEL_MAP="gpt-5.4:deepseek-v4-pro,gpt-5.5:deepseek-v4-pro"`
-fn map_model_name(name: &str) -> String {
+pub(crate) fn map_model_name(name: &str) -> String {
     if let Ok(map_str) = std::env::var("CODEX_RELAY_MODEL_MAP") {
         for pair in map_str.split(',') {
             let mut parts = pair.splitn(2, ':');
@@ -805,7 +513,7 @@ fn complete_message_tool_arguments(message: &mut ChatMessage) {
     }
 }
 
-fn declared_function_name(tool: &Value) -> Option<&str> {
+pub(crate) fn declared_function_name(tool: &Value) -> Option<&str> {
     tool.get("name").and_then(Value::as_str).or_else(|| {
         tool.get("function")
             .and_then(|function| function.get("name"))
@@ -815,7 +523,7 @@ fn declared_function_name(tool: &Value) -> Option<&str> {
 
 /// If a Responses API function tool takes a single string parameter, return
 /// that parameter's name.
-fn function_tool_string_field(tool: &Value) -> Option<String> {
+pub(crate) fn function_tool_string_field(tool: &Value) -> Option<String> {
     let properties = tool.get("parameters")?.get("properties")?.as_object()?;
     if properties.len() != 1 {
         return None;
@@ -824,7 +532,7 @@ fn function_tool_string_field(tool: &Value) -> Option<String> {
     (schema.get("type").and_then(Value::as_str) == Some("string")).then(|| field.clone())
 }
 
-fn custom_argument_field(name: &str) -> &'static str {
+pub(crate) fn custom_argument_field(name: &str) -> &'static str {
     if name == "apply_patch" {
         "patch"
     } else {
@@ -839,7 +547,7 @@ pub(crate) fn custom_tool_input(arguments: &str, argument_field: &str) -> String
         .unwrap_or_else(|| arguments.to_string())
 }
 
-fn tool_denylist_from_env() -> HashSet<String> {
+pub(crate) fn tool_denylist_from_env() -> HashSet<String> {
     std::env::var("CODEX_RELAY_TOOL_DENYLIST")
         .unwrap_or_default()
         .split(',')

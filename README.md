@@ -82,7 +82,7 @@ env_key = "DEEPSEEK_API_KEY"
 | `--api-key` | `CODEX_RELAY_API_KEY` | _(empty)_ | API key forwarded to upstream |
 | `--opencode-go-compat` | `CODEX_RELAY_OPENCODE_GO_COMPAT` | `false` | Enable OpenCode Go compatibility normalization and schema-reference stripping |
 | `--max-request-bytes` | `CODEX_RELAY_MAX_REQUEST_BYTES` | `67108864` | Maximum inbound Responses request size |
-| `--upstream-extra-params` | `CODEX_RELAY_UPSTREAM_EXTRA_PARAMS` | _(empty)_ | JSON object merged into each upstream Chat Completions request |
+| `--upstream-extra-params` | `CODEX_RELAY_UPSTREAM_EXTRA_PARAMS` | _(empty)_ | JSON object merged into each upstream request |
 | `--drop-upstream-params` | `CODEX_RELAY_DROP_PARAMS` | _(empty)_ | JSON array of top-level upstream request parameters to remove |
 | `--model-map` | `CODEX_RELAY_MODEL_MAP` | _(empty)_ | Comma-separated `source:target` model name translations |
 | `--print-config` | _(none)_ | — | Print a Codex config snippet and exit |
@@ -140,7 +140,7 @@ codex-relay --upstream https://api.deepseek.com/v1 --api-key "$DEEPSEEK_API_KEY"
 | `CODEX_RELAY_API_KEY` | _(empty)_ | API key forwarded to upstream |
 | `CODEX_RELAY_OPENCODE_GO_COMPAT` | `false` | Enable OpenCode Go compatibility normalization and schema-reference stripping |
 | `CODEX_RELAY_MAX_REQUEST_BYTES` | `67108864` | Maximum inbound Responses request size |
-| `CODEX_RELAY_UPSTREAM_EXTRA_PARAMS` | _(empty)_ | JSON object merged into each upstream Chat Completions request body |
+| `CODEX_RELAY_UPSTREAM_EXTRA_PARAMS` | _(empty)_ | JSON object merged into each upstream request body |
 | `CODEX_RELAY_DROP_PARAMS` | _(empty)_ | JSON array of top-level upstream request parameter names to remove before forwarding |
 | `CODEX_RELAY_MODEL_MAP` | _(empty)_ | Comma-separated `source:target` model name translations (e.g., `gpt-5.4:deepseek-v4-pro`) |
 | `CODEX_RELAY_TOOL_DENYLIST` | _(empty)_ | Comma-separated tool names to remove before forwarding tools to the upstream model |
@@ -157,24 +157,60 @@ codex-relay --upstream https://api.deepseek.com/v1 --api-key "$DEEPSEEK_API_KEY"
 
 ### OpenCode Go compatibility
 
-OpenCode Go can reject two otherwise valid Codex request patterns: standalone
-`function_call_output` items without a `call_id`, and recursive or unsupported
-JSON Schema `$ref` nodes in tool definitions. These workarounds are opt-in
-because schema stripping is provider-specific and can change tool semantics:
+This opt-in mode sends **all** requests to the configured upstream's native
+`/responses` endpoint instead of translating them to `/chat/completions`. Use
+an upstream and model that support native Responses (for example, Muse on
+OpenCode Go); there is no automatic fallback to Chat Completions.
 
 ```bash
 CODEX_RELAY_OPENCODE_GO_COMPAT=true \
   codex-relay --upstream https://opencode.ai/zen/go/v1 --api-key "$OPENCODE_GO_API_KEY"
 ```
 
-The feature forwards Muse requests to OpenCode Go's native `/responses`
-endpoint. It converts orphan tool outputs and custom tools into supported
-Responses items, flattens namespace tools, removes unsupported built-in tool
-fields and recursive `$ref` schema nodes, and drops `reasoning.effort=none`.
-It logs only change counts, without request content or credentials. The relay
-also forwards an incoming `x-opencode-session` header, or generates a bounded
-stable fallback and binds it to the upstream response ID for subsequent
-`previous_response_id` requests.
+The bridge normalizes custom tools to structured functions, flattens namespace
+tools, and bounds upstream tool names to 64 bytes. It restores the original
+client identities on both JSON responses and SSE events, including Codex
+`apply_patch` custom calls and namespace routing. History items, forced
+`tool_choice`, and `allowed_tools` choices use the same mapping. Ambiguous
+names or forced choices targeting unavailable tools return HTTP 422.
+
+Text and reasoning SSE events are forwarded as they arrive, with keepalives
+while the provider is idle. Custom tool arguments are buffered **per tool**
+until complete JSON is available, then emitted as raw custom-input events.
+Malformed/truncated streams produce `response.failed`; unknown or duplicate
+tool calls are rejected. Response usage and other provider metadata survive
+the translation.
+
+Provider-specific workarounds are limited to this mode:
+
+- Orphan function/custom tool outputs without a `call_id` become explicitly
+  labeled, untrusted **user** messages, never developer/system instructions.
+- JSON Schema `$ref` keywords are removed from tool parameter schemas while
+  preserving sibling constraints, literal property names, and example data.
+  This can broaden the accepted schema: enable it only for an upstream that
+  requires this workaround.
+- Unsupported hosted tools are dropped (`web_search_preview` is preserved).
+- `reasoning.effort=none` is removed while preserving other reasoning fields.
+
+Model mappings, tool denylists, and upstream extra/drop parameters also apply
+in this mode. A tool injected through extra parameters cannot authorize a
+call absent from the original client declarations. Overrides that change the
+client's streaming mode are rejected.
+
+An incoming `x-opencode-session` header (1–256 ASCII bytes) is forwarded.
+Otherwise, each new conversation gets a random identity; a known
+`previous_response_id` reuses its identity. Bindings are held in memory and
+bounded by `--max-sessions` and `--session-ttl-hours`. Clients replaying full
+history without `previous_response_id` should provide the session header to
+retain a provider session. Prompt text is never used as a session identifier.
+Native conversation history remains upstream; the relay's disk history store
+is used only by the Chat Completions path. Corpus recording with
+`--record-corpus` is not supported in native mode and is rejected at startup.
+Normalization logs contain change counts, not request contents or credentials.
+
+The configurable inbound body limit defaults to 64 MiB **in both modes**;
+raise `--max-request-bytes` / `CODEX_RELAY_MAX_REQUEST_BYTES` for larger image
+requests. Requests exceeding the limit return HTTP 413.
 
 Some providers need workarounds that are not part of the Responses ⇄ Chat Completions translation itself. These are registered as named quirks (see `src/quirks.rs` for the full registry, triggers, and removal criteria):
 

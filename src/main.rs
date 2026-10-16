@@ -1,5 +1,6 @@
 mod corpus;
 mod dsml;
+mod opencode;
 mod quirks;
 mod session;
 mod stream;
@@ -10,7 +11,6 @@ mod upstream_request;
 
 use anyhow::{bail, Context, Result};
 use axum::{
-    body::Body,
     extract::{DefaultBodyLimit, Request, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -21,14 +21,7 @@ use clap::Parser;
 use corpus::CorpusRecorder;
 use reqwest::{Client, Url};
 use session::{SessionStore, DEFAULT_MAX_SESSIONS, DEFAULT_MAX_SESSION_BYTES, DEFAULT_SESSION_TTL};
-use std::{
-    collections::{HashMap, VecDeque},
-    fs,
-    path::PathBuf,
-    process::Command,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{fs, path::PathBuf, process::Command, sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 use types::*;
 use upstream_request::UpstreamRequestConfig;
@@ -72,7 +65,7 @@ struct Args {
     )]
     max_request_bytes: usize,
 
-    /// JSON object merged into every upstream Chat Completions request body.
+    /// JSON object merged into every upstream request body.
     #[arg(long, env = "CODEX_RELAY_UPSTREAM_EXTRA_PARAMS")]
     upstream_extra_params: Option<String>,
 
@@ -145,61 +138,7 @@ struct AppState {
     upstream_request: Arc<UpstreamRequestConfig>,
     corpus: Option<CorpusRecorder>,
     opencode_go_compat: bool,
-    opencode_sessions: OpenCodeSessionRegistry,
-}
-
-#[derive(Clone)]
-struct OpenCodeSessionRegistry {
-    state: Arc<Mutex<OpenCodeSessionState>>,
-    max_entries: usize,
-}
-
-struct OpenCodeSessionState {
-    by_response: HashMap<String, String>,
-    order: VecDeque<String>,
-}
-
-impl OpenCodeSessionRegistry {
-    fn new(max_entries: usize) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(OpenCodeSessionState {
-                by_response: HashMap::new(),
-                order: VecDeque::new(),
-            })),
-            max_entries: max_entries.max(1),
-        }
-    }
-
-    fn session_for_request(&self, previous_response_id: Option<&str>, fallback: String) -> String {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        previous_response_id
-            .and_then(|id| state.by_response.get(id))
-            .cloned()
-            .unwrap_or(fallback)
-    }
-
-    fn bind(&self, response_id: String, session_id: String) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state
-            .by_response
-            .insert(response_id.clone(), session_id)
-            .is_some()
-        {
-            state.order.retain(|id| id != &response_id);
-        }
-        state.order.push_back(response_id);
-        while state.order.len() > self.max_entries {
-            if let Some(oldest) = state.order.pop_front() {
-                state.by_response.remove(&oldest);
-            }
-        }
-    }
+    opencode_sessions: opencode::SessionRegistry,
 }
 
 #[tokio::main]
@@ -212,6 +151,9 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    if args.opencode_go_compat && args.record_corpus.is_some() {
+        bail!("--record-corpus is not supported with native OpenCode Go Responses; disable recording or compatibility mode");
+    }
 
     let upstream = validate_upstream(&args.upstream)?;
     let upstream_request = Arc::new(UpstreamRequestConfig::from_raw(
@@ -283,7 +225,7 @@ async fn main() -> Result<()> {
         upstream_request: upstream_request.clone(),
         corpus,
         opencode_go_compat: args.opencode_go_compat,
-        opencode_sessions: OpenCodeSessionRegistry::new(args.max_sessions),
+        opencode_sessions: opencode::SessionRegistry::new(args.max_sessions, session_ttl),
     };
     info!(
         "session retention: store={} dir={} ttl={}h max_sessions={} max_session_memory={} MiB",
@@ -840,24 +782,11 @@ async fn handle_responses(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let payload: serde_json::Value = match serde_json::from_slice(&body) {
-        Ok(payload) => payload,
-        Err(e) => {
-            error!(
-                error_category = ?e.classify(),
-                line = e.line(),
-                column = e.column(),
-                body_bytes = body.len(),
-                "JSON parse error"
-            );
-            return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response();
-        }
-    };
-    let req: ResponsesRequest = match serde_json::from_value(payload.clone()) {
-        Ok(r) => r,
-        Err(e) => {
-            error!("request shape parse error: {e}");
-            return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response();
+    let req: ResponsesRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(error) => {
+            error!(error_category = ?error.classify(), line = error.line(), column = error.column(), body_bytes = body.len(), "request parse error");
+            return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response();
         }
     };
     debug!(
@@ -876,18 +805,15 @@ async fn handle_responses(
         summarize_debug_names(response_tool_debug_names(&req.tools))
     );
 
-    let incoming_opencode_session = headers
-        .get("x-opencode-session")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned);
-
     if state.opencode_go_compat {
-        return handle_opencode_responses(state, payload, req, headers, incoming_opencode_session)
-            .await;
+        let payload = match serde_json::from_slice(&body) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response()
+            }
+        };
+        return handle_opencode_responses(state, payload, req, headers).await;
     }
-
     handle_responses_inner(state, req).await
 }
 
@@ -896,35 +822,57 @@ async fn handle_opencode_responses(
     mut payload: serde_json::Value,
     req: ResponsesRequest,
     headers: HeaderMap,
-    incoming_opencode_session: Option<String>,
 ) -> Response {
-    let (normalized_outputs, stripped_refs, stripped_fields) =
-        translate::normalize_opencode_go_responses_payload(&mut payload);
-    if normalized_outputs > 0 {
-        warn!(
-            "opencode_go_compat normalized {} orphan function_call_output item(s)",
-            normalized_outputs
-        );
-    }
-    if stripped_refs > 0 {
-        warn!(
-            "opencode_go_compat stripped {} tool schema $ref node(s)",
-            stripped_refs
-        );
-    }
-    if stripped_fields > 0 {
-        warn!(
-            "opencode_go_compat stripped {} unsupported tool field(s)",
-            stripped_fields
-        );
-    }
-
-    let session_id = incoming_opencode_session.unwrap_or_else(|| {
-        state.opencode_sessions.session_for_request(
-            req.previous_response_id.as_deref(),
-            translate::opencode_session_id_for_request(&req),
+    payload["model"] = serde_json::json!(translate::map_model_name(&req.model));
+    let payload = match state.upstream_request.value_body(payload) {
+        Ok(payload) => payload,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    };
+    if payload
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        != req.stream
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "upstream overrides must not change stream mode",
         )
-    });
+            .into_response();
+    }
+    let prepared = match opencode::PreparedRequest::new(payload, &req.tools) {
+        Ok(prepared) => prepared,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    };
+    debug!(
+        orphan_outputs = prepared.changes.orphan_outputs,
+        schema_refs = prepared.changes.schema_refs,
+        tool_fields = prepared.changes.tool_fields,
+        "OpenCode Go normalization"
+    );
+    let session = match headers.get("x-opencode-session") {
+        Some(header) => match header
+            .to_str()
+            .ok()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.len() <= 256)
+        {
+            Some(session) => session.to_owned(),
+            None => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "x-opencode-session must be 1 to 256 ASCII bytes",
+                )
+                    .into_response()
+            }
+        },
+        None => state.opencode_sessions.session_for_request(
+            prepared
+                .payload
+                .get("previous_response_id")
+                .and_then(serde_json::Value::as_str),
+        ),
+    };
     let url = format!("{}responses", join_base(&state.upstream));
     let mut builder = state
         .client
@@ -942,7 +890,7 @@ async fn handle_opencode_responses(
             "User-Agent",
             format!("codex-relay/{}", env!("CARGO_PKG_VERSION")),
         )
-        .header("x-opencode-session", session_id.as_str());
+        .header("x-opencode-session", &session);
     if !state.api_key.is_empty() {
         builder = builder.bearer_auth(state.api_key.as_str());
     }
@@ -951,76 +899,25 @@ async fn handle_opencode_responses(
             builder = builder.header(name, value);
         }
     }
-
-    let upstream = match builder.json(&payload).send().await {
-        Ok(response) => response,
-        Err(e) => {
-            error!("OpenCode Go Responses request failed: {e}");
-            return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
-        }
-    };
-    let status = upstream.status();
-    let content_type = upstream.headers().get("content-type").cloned();
-    let body = match upstream.bytes().await {
-        Ok(body) => body,
-        Err(e) => {
-            error!("OpenCode Go Responses body read failed: {e}");
-            return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
-        }
-    };
-    if !status.is_success() {
-        error!("upstream {status}: OpenCode Go Responses request failed");
-        return (
-            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            body,
+    let builder = builder.json(&prepared.payload);
+    if req.stream {
+        opencode::forward_stream(
+            builder,
+            prepared.tools,
+            req.model,
+            state.opencode_sessions,
+            session,
         )
-            .into_response();
+    } else {
+        opencode::forward_json(
+            builder,
+            prepared.tools,
+            &req.model,
+            &state.opencode_sessions,
+            &session,
+        )
+        .await
     }
-
-    if let Some(response_id) = opencode_response_id(&body, req.stream) {
-        state
-            .opencode_sessions
-            .bind(response_id, session_id.to_owned());
-    }
-
-    let mut response = Response::builder().status(status);
-    if let Some(content_type) = content_type {
-        response = response.header("content-type", content_type);
-    }
-    response
-        .body(Body::from(body))
-        .unwrap_or_else(|e| (StatusCode::BAD_GATEWAY, e.to_string()).into_response())
-}
-
-fn opencode_response_id(body: &[u8], stream: bool) -> Option<String> {
-    if !stream {
-        return serde_json::from_slice::<serde_json::Value>(body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            });
-    }
-
-    body.split(|byte| *byte == b'\n')
-        .filter_map(|line| line.strip_prefix(b"data:"))
-        .filter_map(|data| {
-            let data = data.strip_prefix(b" ").unwrap_or(data);
-            serde_json::from_slice::<serde_json::Value>(data).ok()
-        })
-        .find_map(|event| {
-            (event.get("type").and_then(serde_json::Value::as_str) == Some("response.created"))
-                .then(|| {
-                    event
-                        .get("response")
-                        .and_then(|response| response.get("id"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                })
-                .flatten()
-        })
 }
 
 async fn handle_responses_inner(state: AppState, mut req: ResponsesRequest) -> Response {
@@ -1043,27 +940,7 @@ async fn handle_responses_inner(state: AppState, mut req: ResponsesRequest) -> R
     let model = req.model.clone();
     let namespace_tools = translate::namespace_tool_map(&req.tools);
     let custom_tools = translate::custom_tool_map(&req.tools);
-    let mut chat_req = if state.opencode_go_compat {
-        translate::to_chat_request_with_options(
-            &req,
-            history,
-            &state.sessions,
-            translate::TranslateOptions {
-                opencode_go_compat: true,
-            },
-        )
-    } else {
-        translate::to_chat_request(&req, history, &state.sessions)
-    };
-    if state.opencode_go_compat {
-        let stripped = translate::strip_tool_schema_refs(&mut chat_req.tools);
-        if stripped > 0 {
-            warn!(
-                "opencode_go_compat stripped {} tool schema $ref node(s)",
-                stripped
-            );
-        }
-    }
+    let mut chat_req = translate::to_chat_request(&req, history, &state.sessions);
     debug!(
         "→ upstream tools={}",
         summarize_debug_names(chat_tool_debug_names(&chat_req.tools))
@@ -1071,8 +948,8 @@ async fn handle_responses_inner(state: AppState, mut req: ResponsesRequest) -> R
     let url = format!("{}chat/completions", join_base(&state.upstream));
 
     let previous_response_id = req.previous_response_id.clone();
-    let response_id = state.sessions.new_id();
     if req.stream {
+        let response_id = state.sessions.new_id();
         chat_req.stream = true;
         let request_messages = chat_req.messages.clone();
         stream::translate_stream(stream::StreamArgs {
@@ -1101,7 +978,6 @@ async fn handle_responses_inner(state: AppState, mut req: ResponsesRequest) -> R
             namespace_tools,
             custom_tools,
             previous_response_id,
-            response_id,
         )
         .await
     }
@@ -1406,7 +1282,6 @@ async fn handle_blocking(
     namespace_tools: translate::NamespaceToolMap,
     custom_tools: translate::CustomToolMap,
     previous_response_id: Option<String>,
-    response_id: String,
 ) -> Response {
     let mut builder = state
         .client
@@ -1470,6 +1345,7 @@ async fn handle_blocking(
                         "← upstream function_calls={}",
                         summarize_debug_names(chat_response_tool_call_debug_names(&chat_resp))
                     );
+                    let response_id = state.sessions.new_id();
                     let (resp, assistant_messages) =
                         if namespace_tools.is_empty() && custom_tools.is_empty() {
                             translate::from_chat_response(response_id.clone(), &model, chat_resp)

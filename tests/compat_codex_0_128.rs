@@ -20,10 +20,7 @@
 //! Live end-to-end coverage against real DeepSeek is in `compat_deepseek_live.rs`.
 
 use codex_relay::session::SessionStore;
-use codex_relay::translate::{
-    normalize_opencode_go_responses_payload, opencode_session_id_for_request,
-    strip_tool_schema_refs, to_chat_request, to_chat_request_with_options, TranslateOptions,
-};
+use codex_relay::translate::to_chat_request;
 use codex_relay::types::ResponsesRequest;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -132,113 +129,4 @@ fn unknown_top_level_fields_dont_break_parse() {
     // (Negative coverage — fixture::with_namespace_tool has a few of them.)
     let req = fixture("with_namespace_tool.json");
     assert_eq!(req.model, "deepseek-v4-pro");
-}
-
-#[test]
-fn opencode_go_compat_normalizes_orphan_tool_output() {
-    let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
-        "model": "muse-spark-1.3-contributor",
-        "input": [{
-            "type": "function_call_output",
-            "namespace": "browser",
-            "name": "open",
-            "output": {"text": "done"}
-        }]
-    }))
-    .unwrap();
-
-    let default_chat = to_chat_request(&req, Vec::new(), &SessionStore::new());
-    assert_eq!(default_chat.messages[0].role, "tool");
-    assert_eq!(default_chat.messages[0].tool_call_id.as_deref(), Some(""));
-
-    let chat = to_chat_request_with_options(
-        &req,
-        Vec::new(),
-        &SessionStore::new(),
-        TranslateOptions {
-            opencode_go_compat: true,
-        },
-    );
-    assert_eq!(chat.messages[0].role, "system");
-    assert_eq!(
-        chat.messages[0].text_content(),
-        "[browser/open output]\n{\"text\":\"done\"}"
-    );
-    assert!(chat.messages[0].tool_call_id.is_none());
-}
-
-#[test]
-fn opencode_go_compat_strips_tool_schema_refs() {
-    let mut tools = vec![serde_json::json!({
-        "type": "function",
-        "name": "recursive",
-        "parameters": {"properties": {"child": {"$ref": "#/$defs/Node"}}}
-    })];
-    assert_eq!(strip_tool_schema_refs(&mut tools), 1);
-    assert_eq!(
-        tools[0]["parameters"]["properties"]["child"],
-        serde_json::json!({})
-    );
-}
-
-#[test]
-fn opencode_session_fallback_is_stable_for_the_same_first_message() {
-    let first: ResponsesRequest = serde_json::from_value(serde_json::json!({
-        "model": "muse-spark-1.3-contributor",
-        "input": "hello"
-    }))
-    .unwrap();
-    let second: ResponsesRequest = serde_json::from_value(serde_json::json!({
-        "model": "muse-spark-1.3-contributor",
-        "input": "hello"
-    }))
-    .unwrap();
-
-    assert_eq!(
-        opencode_session_id_for_request(&first),
-        opencode_session_id_for_request(&second)
-    );
-}
-
-#[test]
-fn opencode_go_compat_strips_invalid_search_content_types() {
-    let mut payload = serde_json::json!({
-        "input": "hello",
-        "tools": [{
-            "type": "web_search",
-            "search_content_types": ["text"]
-        }]
-    });
-
-    let (_, _, stripped_fields) = normalize_opencode_go_responses_payload(&mut payload);
-    assert_eq!(stripped_fields, 1);
-    assert!(payload["tools"][0].get("search_content_types").is_none());
-}
-
-#[test]
-fn opencode_go_compat_strips_unsupported_none_reasoning_effort() {
-    let mut payload = serde_json::json!({
-        "input": "hello",
-        "reasoning": {"effort": "none"}
-    });
-
-    let (_, _, stripped_fields) = normalize_opencode_go_responses_payload(&mut payload);
-    assert_eq!(stripped_fields, 1);
-    assert!(payload.get("reasoning").is_none());
-}
-
-#[test]
-fn opencode_go_compat_converts_custom_tools_to_function_tools() {
-    let mut payload = serde_json::json!({
-        "input": "hello",
-        "tools": [{"type": "custom", "name": "apply_patch"}]
-    });
-
-    let (_, _, stripped_fields) = normalize_opencode_go_responses_payload(&mut payload);
-    assert_eq!(stripped_fields, 1);
-    assert_eq!(payload["tools"][0]["type"], "function");
-    assert_eq!(
-        payload["tools"][0]["parameters"]["properties"]["patch"]["type"],
-        "string"
-    );
 }

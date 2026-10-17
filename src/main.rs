@@ -3,6 +3,7 @@ mod dsml;
 mod opencode;
 mod quirks;
 mod session;
+mod shutdown;
 mod stream;
 mod think;
 mod translate;
@@ -246,6 +247,10 @@ async fn main() -> Result<()> {
         info!("OpenCode Go compatibility enabled");
     }
 
+    // Register before starting the server or announcing readiness. Registration
+    // errors must reach main rather than complete an Axum shutdown future.
+    let signals = shutdown::Signals::new()?;
+
     // Fetch upstream model list asynchronously for user visibility
     tokio::spawn(log_upstream_models(client, Arc::new(upstream), api_key));
 
@@ -270,7 +275,7 @@ async fn main() -> Result<()> {
         listener.local_addr()?,
         state.upstream.as_ref()
     );
-    axum::serve(listener, app).await?;
+    shutdown::serve(listener, app, signals).await?;
 
     Ok(())
 }

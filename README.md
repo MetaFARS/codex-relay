@@ -130,6 +130,18 @@ codex-relay --upstream https://api.deepseek.com/v1 --api-key "$DEEPSEEK_API_KEY"
 - **Model catalog** — proxies `/v1/models` from the upstream provider
 - **Auto-config** — `--print-config` generates a complete Codex config with model metadata
 
+### Shutdown
+
+Ctrl-C, or SIGTERM on Unix, stops accepting new connections and waits for active
+requests to finish, including streaming responses. Normal shutdown exits with
+status 0. When disk history or corpus recording is enabled, completed Chat
+Completions turns are written before normal shutdown completes.
+
+The first signal waits without a timeout. A second supported shutdown signal
+interrupts a stalled drain and exits with status 1; unfinished requests can be
+interrupted. Signal listeners are registered before the server announces
+readiness, and registration failures exit with a nonzero status.
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -242,6 +254,10 @@ proc.terminate()
 
 Two layers — offline tests pin behavior against captured Codex wire-shape;
 live tests pin behavior against real provider APIs.
+
+Unix shutdown tests launch the real binary and send process signals. On dynamic
+Linux/glibc builds, startup-failure tests also compile a small C fault-injection
+fixture with `cc`; the fixture is loaded only into the test child process.
 
 ## Debugging tool round-trips
 

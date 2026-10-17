@@ -57,9 +57,8 @@ pub fn to_chat_request(
     }
 
     // History can contain poison blank messages from an earlier turn. Remove
-    // them before deciding whether an existing system prompt suppresses the
-    // current request's instructions. Keep the newest one as a fallback in
-    // case the complete history and input contain nothing else.
+    // them before merging the current request's system instructions. Keep the
+    // newest one as a fallback if history and input contain nothing else.
     let mut latest_contentless_fallback = messages
         .iter()
         .rev()
@@ -73,21 +72,8 @@ pub fn to_chat_request(
         .as_ref()
         .filter(|text| !text.trim().is_empty())
         .or_else(|| req.system.as_ref().filter(|text| !text.trim().is_empty()));
-    if let Some(system) = system_text {
-        if messages.is_empty() || messages[0].role != "system" {
-            messages.insert(
-                0,
-                ChatMessage {
-                    role: "system".into(),
-                    content: Some(Value::String(system.clone())),
-                    reasoning_content: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                },
-            );
-        }
-    }
+
+    let request_has_system = system_text.is_some();
 
     // Append new input, mapping Responses API roles to Chat Completions roles.
     match &req.input {
@@ -211,7 +197,8 @@ pub fn to_chat_request(
                     };
                     // Fallback: try turn-level fingerprint if call_id lookup missed
                     if msg.reasoning_content.is_none() {
-                        msg.reasoning_content = sessions.get_turn_reasoning(&messages, &msg);
+                        msg.reasoning_content =
+                            request_turn_reasoning(sessions, &messages, &msg, system_text);
                     }
                     messages.push(msg);
                 } else {
@@ -253,7 +240,7 @@ pub fn to_chat_request(
                             // DeepSeek that require reasoning_content to be passed back).
                             if msg.role == "assistant" {
                                 msg.reasoning_content =
-                                    sessions.get_turn_reasoning(&messages, &msg);
+                                    request_turn_reasoning(sessions, &messages, &msg, system_text);
                             }
                             // System/developer messages from input items must go to the
                             // front of the array. Codex sometimes interleaves them between
@@ -262,7 +249,15 @@ pub fn to_chat_request(
                             // Chat Completions API.
                             if msg.role == "system" {
                                 if !messages.is_empty() && messages[0].role == "system" {
-                                    messages[0] = msg; // replace existing system prompt
+                                    if request_has_system {
+                                        // Input developer/system messages belong to the
+                                        // conversation, independently of the request's base prompt.
+                                        merge_system_message(&mut messages[0], msg);
+                                    } else {
+                                        // Keep historical relay behavior for callers that did not
+                                        // provide request-level instructions/system.
+                                        messages[0] = msg;
+                                    }
                                 } else {
                                     messages.insert(0, msg);
                                 }
@@ -276,6 +271,13 @@ pub fn to_chat_request(
             }
         }
     }
+
+    // Persist only conversation input. The base prompt is request-scoped,
+    // whereas input developer/system rules must survive previous_response_id.
+    // Older sessions lack this separation: preserve their system content
+    // conservatively rather than guessing which instructions can be discarded.
+    let retained_messages = messages.clone();
+    prepend_request_instructions(&mut messages, system_text);
 
     drop_contentless_messages(&mut messages);
     if messages.is_empty() {
@@ -302,6 +304,7 @@ pub fn to_chat_request(
     ChatRequest {
         model: mapped_model,
         messages,
+        retained_messages,
         tools: convert_tools(&req.tools),
         temperature: req.temperature,
         max_tokens: req.max_output_tokens,
@@ -413,7 +416,11 @@ pub fn custom_tool_map(tools: &[Value]) -> CustomToolMap {
 
 fn custom_tool_entry(tool: &Value, denied: &HashSet<String>) -> Option<(String, CustomToolName)> {
     let tool_type = tool.get("type").and_then(Value::as_str)?;
-    let name = tool.get("name").and_then(Value::as_str)?;
+    let name = if tool_type == "function" {
+        declared_function_name(tool)?
+    } else {
+        tool.get("name").and_then(Value::as_str)?
+    };
     if denied.contains(name) {
         return None;
     }
@@ -514,22 +521,84 @@ fn complete_message_tool_arguments(message: &mut ChatMessage) {
 }
 
 fn declared_function_name(tool: &Value) -> Option<&str> {
-    tool.get("name").and_then(Value::as_str).or_else(|| {
-        tool.get("function")
-            .and_then(|function| function.get("name"))
-            .and_then(Value::as_str)
-    })
+    tool.get("function")
+        .unwrap_or(tool)
+        .get("name")
+        .and_then(Value::as_str)
 }
 
 /// If a Responses API function tool takes a single string parameter, return
 /// that parameter's name.
-fn function_tool_string_field(tool: &Value) -> Option<String> {
-    let properties = tool.get("parameters")?.get("properties")?.as_object()?;
+fn string_field_from_parameters(parameters: &Value) -> Option<String> {
+    let properties = parameters.get("properties")?.as_object()?;
     if properties.len() != 1 {
         return None;
     }
+
     let (field, schema) = properties.iter().next()?;
     (schema.get("type").and_then(Value::as_str) == Some("string")).then(|| field.clone())
+}
+
+fn function_tool_string_field(tool: &Value) -> Option<String> {
+    string_field_from_parameters(tool.get("function").unwrap_or(tool).get("parameters")?)
+}
+
+fn apply_patch_chat_description(argument_field: &str, original: Option<&str>) -> String {
+    let mut description = format!(
+        "Apply a Codex patch. Use this as a normal function tool and pass the complete \
+patch text in the `{argument_field}` string argument.
+
+Syntax:
+
+*** Begin Patch
+*** Update File: path/to/file
+@@
+ context line
+-old line
++new line
+*** End Patch
+
+Rule:
+
+First/final lines are exactly `*** Begin Patch` / `*** End Patch`.
+Use `*** Add File:` / `*** Delete File:` / `*** Update File:` to create/delete/modify a file.
+Use file paths permitted by the caller's workspace and editing rules.
+For `*** Add File:`, prefix every content line with `+`.
+Use `@@` or `@@ <context>` to locate update hunks; do not use unified-diff line numbers.
+Use `*** Move to:` for renames and `*** End of File` to anchor a change at the end of a file.
+Update-hunk lines must start with ` ` (for context lines), `-` (for old lines), or `+` (for new lines). \
+Omit context lines when changed lines uniquely locate the edit."
+    );
+
+    // Remove only known Codex transport prose. Never replace the complete
+    // caller-supplied description: it can contain independent editing rules.
+    let original = original.unwrap_or_default();
+    let additional = original.strip_prefix(&description).unwrap_or(original);
+    let mut additional = additional
+        .strip_prefix("\n\nAdditional tool instructions:\n")
+        .unwrap_or(additional)
+        .to_string();
+    for obsolete in [
+        "This is a FREEFORM tool, so do not wrap the patch in JSON.",
+        "This is a FREEFORM tool...",
+        "This is a FREEFORM tool.",
+        "Do not wrap the patch in JSON.",
+    ] {
+        let lower = additional.to_ascii_lowercase();
+        for (start, matched) in lower
+            .match_indices(&obsolete.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            additional.replace_range(start..start + matched.len(), "");
+        }
+    }
+    if !additional.trim().is_empty() {
+        description.push_str("\n\nAdditional tool instructions:\n");
+        description.push_str(additional.trim());
+    }
+    description
 }
 
 fn custom_argument_field(name: &str) -> &'static str {
@@ -606,10 +675,17 @@ fn convert_custom_tool(tool: &Value, denied: &HashSet<String>) -> Option<Value> 
         return None;
     }
     let argument_field = custom_argument_field(name);
-    let description = tool
-        .get("description")
-        .and_then(Value::as_str)
-        .unwrap_or("Provide the raw custom tool input.");
+    let description = if name == "apply_patch" {
+        apply_patch_chat_description(
+            argument_field,
+            tool.get("description").and_then(Value::as_str),
+        )
+    } else {
+        tool.get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("Provide the raw custom tool input.")
+            .to_string()
+    };
     Some(json!({
         "type": "function",
         "function": {
@@ -661,9 +737,21 @@ fn convert_tool_with_name(tool: &Value, override_name: Option<&str>) -> Value {
     // Already in Chat Completions format if it has a "function" sub-object.
     if obj.contains_key("function") {
         let mut tool = tool.clone();
-        if let Some(name) = override_name {
-            if let Some(func) = tool.get_mut("function").and_then(Value::as_object_mut) {
+        if let Some(func) = tool.get_mut("function").and_then(Value::as_object_mut) {
+            if let Some(name) = override_name {
                 func.insert("name".into(), Value::String(name.to_string()));
+            }
+            let effective_name = func.get("name").and_then(Value::as_str);
+            if effective_name == Some("apply_patch") {
+                let argument_field = func
+                    .get("parameters")
+                    .and_then(string_field_from_parameters)
+                    .unwrap_or_else(|| custom_argument_field("apply_patch").to_string());
+                let description = apply_patch_chat_description(
+                    &argument_field,
+                    func.get("description").and_then(Value::as_str),
+                );
+                func.insert("description".into(), Value::String(description));
             }
         }
         return tool;
@@ -676,7 +764,18 @@ fn convert_tool_with_name(tool: &Value, override_name: Option<&str>) -> Value {
         } else if let Some(v) = obj.get("name") {
             func.insert("name".into(), v.clone());
         }
-        if let Some(v) = obj.get("description") {
+        let effective_name = override_name.or_else(|| obj.get("name").and_then(Value::as_str));
+        if effective_name == Some("apply_patch") {
+            let argument_field = function_tool_string_field(tool)
+                .unwrap_or_else(|| custom_argument_field("apply_patch").to_string());
+            func.insert(
+                "description".into(),
+                Value::String(apply_patch_chat_description(
+                    &argument_field,
+                    obj.get("description").and_then(Value::as_str),
+                )),
+            );
+        } else if let Some(v) = obj.get("description") {
             func.insert("description".into(), v.clone());
         }
         if let Some(v) = obj.get("parameters") {
@@ -913,6 +1012,69 @@ fn is_contentless_response_message(item: &Value) -> bool {
     let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
     matches!(role, "user" | "system" | "developer")
         && is_content_value_contentless(item.get("content"))
+}
+
+fn prepend_request_instructions(messages: &mut Vec<ChatMessage>, system_text: Option<&String>) {
+    let Some(system) = system_text else { return };
+    let mut current_system = ChatMessage {
+        role: "system".into(),
+        content: Some(Value::String(system.clone())),
+        reasoning_content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    };
+    if messages
+        .first()
+        .is_some_and(|message| message.role == "system")
+    {
+        merge_system_message(&mut current_system, messages.remove(0));
+    }
+    messages.insert(0, current_system);
+}
+
+fn request_turn_reasoning(
+    sessions: &SessionStore,
+    messages: &[ChatMessage],
+    assistant: &ChatMessage,
+    system_text: Option<&String>,
+) -> Option<String> {
+    // Reasoning is indexed against the actual upstream context, which includes
+    // the current request instructions even though retained history excludes them.
+    if system_text.is_some() {
+        let mut prior = messages.to_vec();
+        prepend_request_instructions(&mut prior, system_text);
+        sessions.get_turn_reasoning(&prior, assistant)
+    } else {
+        sessions.get_turn_reasoning(messages, assistant)
+    }
+}
+
+fn merge_system_message(existing: &mut ChatMessage, incoming: ChatMessage) {
+    existing.content = match (existing.content.take(), incoming.content) {
+        (Some(Value::String(mut base)), Some(Value::String(runtime))) => {
+            if !base.trim().is_empty() && !runtime.trim().is_empty() {
+                base.push_str("\n\n");
+            }
+            base.push_str(&runtime);
+            Some(Value::String(base))
+        }
+        (content, None) | (None, content) => content,
+        (Some(base), Some(runtime)) => {
+            let mut parts = system_content_parts(base);
+            parts.push(json!({"type": "text", "text": "\n\n"}));
+            parts.extend(system_content_parts(runtime));
+            Some(Value::Array(parts))
+        }
+    };
+}
+
+fn system_content_parts(content: Value) -> Vec<Value> {
+    match content {
+        Value::Array(parts) => parts,
+        Value::String(text) => vec![json!({"type": "text", "text": text})],
+        content => vec![json!({"type": "text", "text": content.to_string()})],
+    }
 }
 
 fn response_message_to_chat(item: &Value) -> ChatMessage {
@@ -2377,18 +2539,72 @@ mod tests {
     }
 
     /// When both `instructions` and a developer input item provide a system
-    /// prompt, the later one (from input items) wins.
+    /// prompt, both instruction layers must reach the upstream.
     #[test]
-    fn test_system_from_input_replaces_instructions() {
+    fn test_developer_input_merges_with_instructions() {
         let sessions = SessionStore::new();
         let mut req = base_req(ResponsesInput::Messages(vec![
             json!({"type": "message", "role": "user", "content": "hi"}),
-            json!({"type": "message", "role": "developer", "content": "override"}),
+            json!({"type": "message", "role": "developer", "content": "runtime"}),
         ]));
-        req.instructions = Some("original".into());
+        req.instructions = Some("base".into());
+
         let chat = to_chat_request(&req, vec![], &sessions);
+
         assert_eq!(chat.messages[0].role, "system");
-        assert_eq!(chat.messages[0].text_content(), "override");
+        assert_eq!(chat.messages[0].text_content(), "base\n\nruntime");
+    }
+
+    #[test]
+    fn test_multipart_developer_merges_with_instructions() {
+        let sessions = SessionStore::new();
+        let mut req = base_req(ResponsesInput::Messages(vec![
+            json!({
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    {"type": "input_text", "text": "<skills>rules</skills>"},
+                    {"type": "input_text", "text": "<permissions>workspace</permissions>"}
+                ]
+            }),
+            json!({"type": "message", "role": "user", "content": "hi"}),
+        ]));
+        req.instructions = Some("local coder base".into());
+
+        let chat = to_chat_request(&req, vec![], &sessions);
+
+        assert_eq!(
+            chat.messages[0].text_content(),
+            "local coder base\n\n<skills>rules</skills><permissions>workspace</permissions>"
+        );
+    }
+
+    #[test]
+    fn test_current_instructions_refresh_without_dropping_developer_history() {
+        let sessions = SessionStore::new();
+        let mut initial = base_req(ResponsesInput::Messages(vec![json!({
+            "type": "message", "role": "developer", "content": "old runtime"
+        })]));
+        initial.instructions = Some("old base".into());
+        let history = to_chat_request(&initial, vec![], &sessions).retained_messages;
+
+        let mut req = base_req(ResponsesInput::Messages(vec![
+            json!({
+                "type": "message",
+                "role": "developer",
+                "content": "current runtime"
+            }),
+            json!({"type": "message", "role": "user", "content": "hi"}),
+        ]));
+
+        req.instructions = Some("current base".into());
+
+        let chat = to_chat_request(&req, history, &sessions);
+
+        assert_eq!(
+            chat.messages[0].text_content(),
+            "current base\n\nold runtime\n\ncurrent runtime"
+        );
     }
 
     // ── Model name mapping tests (#4) ─────────────────────────────────

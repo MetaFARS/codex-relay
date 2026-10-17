@@ -17,7 +17,9 @@ pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Maps response_id → accumulated message history for that session.
 /// Codex uses `previous_response_id` to continue a conversation; we maintain
-/// the full messages[] here so each Chat Completions call is self-contained.
+/// conversation input and assistant replies here so each Chat Completions call
+/// is self-contained. Request-scoped instructions are added by the translator
+/// and excluded from newly retained histories.
 ///
 /// Also maintains call_id → reasoning_content so that thinking-capable models
 /// (e.g. kimi-k2.6) can have their reasoning_content round-tripped back when

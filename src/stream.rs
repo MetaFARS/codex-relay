@@ -692,7 +692,7 @@ pub fn translate_stream(
             // Save the full request conversation (including current input items)
             // so that history is complete for the next turn.
             let mut messages = request_messages;
-            messages.push(assistant_msg);
+            messages.push(assistant_msg.clone());
             if let Some(corpus) = &corpus {
                 corpus.record_turn(
                     previous_response_id.as_deref(),
@@ -701,7 +701,9 @@ pub fn translate_stream(
                     &messages,
                 );
             }
-            sessions.save_with_id(response_id.clone(), messages);
+            let mut retained_history = chat_req.retained_messages;
+            retained_history.push(assistant_msg);
+            sessions.save_with_id(response_id.clone(), retained_history);
 
             // Build output array for response.completed
             let mut indexed_output_items: Vec<(usize, Value)> = Vec::new();

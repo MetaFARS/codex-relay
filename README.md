@@ -178,8 +178,10 @@ Text and reasoning SSE events are forwarded as they arrive, with keepalives
 while the provider is idle. Custom tool arguments are buffered **per tool**
 until complete JSON is available, then emitted as raw custom-input events.
 Malformed/truncated streams produce `response.failed`; unknown or duplicate
-tool calls are rejected. Response usage and other provider metadata survive
-the translation.
+tool calls, including undeclared native call types, are rejected. Hosted search
+calls require a declared and forwarded `web_search_preview` tool. Response usage
+and other provider metadata survive the translation. `apply_patch` descriptions
+retain caller-supplied editing constraints when their transport prose is normalized.
 
 Provider-specific workarounds are limited to this mode:
 
@@ -282,7 +284,13 @@ The disk backend writes JSON records under:
 ```
 
 Session records contain the translated Chat Completions `messages` retained for
-a response id. Reasoning records keep call-id and turn-fingerprint lookups used
+a response id. New records retain conversation input (including developer/system
+messages) and assistant replies, while excluding the request's top-level
+`instructions`/`system`. Send those top-level instructions again on each request
+where they should apply. Existing records without this separation preserve
+their system content to avoid discarding conversation rules.
+
+Reasoning records keep call-id and turn-fingerprint lookups used
 to round-trip provider reasoning content. The relay keeps only an in-memory
 index for disk-backed entries and loads payloads on demand.
 

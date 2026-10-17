@@ -16,8 +16,8 @@ use std::{
 };
 
 use crate::translate::{
-    custom_argument_field, declared_function_name, function_tool_string_field,
-    tool_denylist_from_env, uses_plaintext_collaboration_args,
+    apply_patch_chat_description, custom_argument_field, declared_function_name,
+    function_tool_string_field, tool_denylist_from_env, uses_plaintext_collaboration_args,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,7 +49,7 @@ impl Tool {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct ToolMap(HashMap<String, Tool>);
+pub struct ToolMap(HashMap<String, Tool>, HashSet<String>);
 
 impl ToolMap {
     fn insert(&mut self, tool: Tool) -> Result<String> {
@@ -113,6 +113,11 @@ impl ToolMap {
             bail!("upstream returned a custom call without a translated function identity");
         }
         if item["type"] != "function_call" {
+            if let Some(kind) = item["type"].as_str() {
+                if kind.ends_with("_call") && !self.1.contains(kind) {
+                    bail!("upstream returned an undeclared native tool call");
+                }
+            }
             return Ok(());
         }
         let tool = self
@@ -238,6 +243,7 @@ impl PreparedRequest {
         registry
             .0
             .retain(|name, tool| requested.0.get(name) == Some(tool));
+        registry.1.retain(|kind| requested.1.contains(kind));
         Ok(Self {
             payload,
             tools: registry,
@@ -319,7 +325,7 @@ fn normalize_tool(
                 // The upstream interface is JSON even if Codex advertises a
                 // freeform tool. Never retain contradictory FREEFORM guidance.
                 object.insert("description".into(), json!(if name == "apply_patch" {
-                    format!("Apply a Codex patch. Call this function with a JSON object whose {field:?} string contains the patch. Patch syntax: *** Begin Patch, followed by *** Add File: path (lines prefixed +), *** Update File: path (context lines and -/+ edits under @@), or *** Delete File: path, ending with *** End Patch. Paths must be relative. This is a structured function call.")
+                    apply_patch_chat_description(field, function.get("description").and_then(Value::as_str))
                 } else { format!("Call the {name} tool with a JSON object whose {field:?} string contains the complete tool input. The following instructions describe the contents of that string, not the function-call wire format:\n{}", function.get("description").and_then(Value::as_str).unwrap_or("Provide the tool input.")) }));
             }
             if let Some(schema) = object.get_mut("parameters") {
@@ -327,7 +333,10 @@ fn normalize_tool(
             }
             out.push(normalized);
         }
-        "web_search_preview" => out.push(tool.clone()),
+        "web_search_preview" => {
+            registry.1.insert("web_search_call".into());
+            out.push(tool.clone());
+        }
         // Keep the original compatibility policy for unsupported hosted tools.
         _ => changes.tool_fields += 1,
     }
@@ -695,6 +704,14 @@ impl StreamTranslator {
                 if event["item"]["type"] == "custom_tool_call" =>
             {
                 bail!("upstream returned an untranslated custom tool call");
+            }
+            "response.output_item.added" | "response.output_item.done" => {
+                self.tools.restore_item(
+                    event
+                        .get_mut("item")
+                        .context("output event needs an item")?,
+                    kind == "response.output_item.done",
+                )?;
             }
             "response.completed" | "response.failed" | "response.incomplete" | "error" => {
                 self.terminal = true

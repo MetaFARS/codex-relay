@@ -92,6 +92,7 @@ mod tests {
     fn chat_request() -> ChatRequest {
         ChatRequest {
             model: "deepseek-v4-pro".into(),
+            retained_messages: Vec::new(),
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: Some(json!("hello")),

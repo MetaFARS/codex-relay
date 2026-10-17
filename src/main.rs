@@ -1395,7 +1395,7 @@ async fn handle_blocking(
                         }
                     }
                     let mut full_history = chat_req.messages;
-                    full_history.extend(assistant_messages);
+                    full_history.extend(assistant_messages.iter().cloned());
                     if let Some(corpus) = &state.corpus {
                         corpus.record_turn(
                             previous_response_id.as_deref(),
@@ -1404,7 +1404,9 @@ async fn handle_blocking(
                             &full_history,
                         );
                     }
-                    state.sessions.save_with_id(response_id, full_history);
+                    let mut retained_history = chat_req.retained_messages;
+                    retained_history.extend(assistant_messages);
+                    state.sessions.save_with_id(response_id, retained_history);
                     Json(resp).into_response()
                 }
             }

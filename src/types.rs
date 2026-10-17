@@ -87,6 +87,11 @@ pub struct InputTokensDetails {
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
+    /// Conversation input without request-scoped `instructions`/`system`.
+    /// Retain this separately so refreshing the base prompt cannot erase
+    /// developer messages or carry old request instructions into a new turn.
+    #[serde(skip)]
+    pub retained_messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]

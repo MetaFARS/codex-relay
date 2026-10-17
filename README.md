@@ -80,7 +80,9 @@ env_key = "DEEPSEEK_API_KEY"
 | `--bind` | `CODEX_RELAY_BIND` | `127.0.0.1` | IP address to bind the listener to (e.g. `0.0.0.0` to accept remote connections) |
 | `--upstream` | `CODEX_RELAY_UPSTREAM` | `https://openrouter.ai/api/v1` | Upstream Chat Completions base URL |
 | `--api-key` | `CODEX_RELAY_API_KEY` | _(empty)_ | API key forwarded to upstream |
-| `--upstream-extra-params` | `CODEX_RELAY_UPSTREAM_EXTRA_PARAMS` | _(empty)_ | JSON object merged into each upstream Chat Completions request |
+| `--opencode-go-compat` | `CODEX_RELAY_OPENCODE_GO_COMPAT` | `false` | Enable OpenCode Go compatibility normalization and schema-reference stripping |
+| `--max-request-bytes` | `CODEX_RELAY_MAX_REQUEST_BYTES` | `67108864` | Maximum inbound Responses request size |
+| `--upstream-extra-params` | `CODEX_RELAY_UPSTREAM_EXTRA_PARAMS` | _(empty)_ | JSON object merged into each upstream request |
 | `--drop-upstream-params` | `CODEX_RELAY_DROP_PARAMS` | _(empty)_ | JSON array of top-level upstream request parameters to remove |
 | `--model-map` | `CODEX_RELAY_MODEL_MAP` | _(empty)_ | Comma-separated `source:target` model name translations |
 | `--print-config` | _(none)_ | — | Print a Codex config snippet and exit |
@@ -128,6 +130,18 @@ codex-relay --upstream https://api.deepseek.com/v1 --api-key "$DEEPSEEK_API_KEY"
 - **Model catalog** — proxies `/v1/models` from the upstream provider
 - **Auto-config** — `--print-config` generates a complete Codex config with model metadata
 
+### Shutdown
+
+Ctrl-C, or SIGTERM on Unix, stops accepting new connections and waits for active
+requests to finish, including streaming responses. Normal shutdown exits with
+status 0. When disk history or corpus recording is enabled, completed Chat
+Completions turns are written before normal shutdown completes.
+
+The first signal waits without a timeout. A second supported shutdown signal
+interrupts a stalled drain and exits with status 1; unfinished requests can be
+interrupted. Signal listeners are registered before the server announces
+readiness, and registration failures exit with a nonzero status.
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -136,7 +150,9 @@ codex-relay --upstream https://api.deepseek.com/v1 --api-key "$DEEPSEEK_API_KEY"
 | `CODEX_RELAY_BIND` | `127.0.0.1` | IP address to bind the listener to (e.g. `0.0.0.0` to accept remote connections) |
 | `CODEX_RELAY_UPSTREAM` | `https://openrouter.ai/api/v1` | Upstream Chat Completions base URL |
 | `CODEX_RELAY_API_KEY` | _(empty)_ | API key forwarded to upstream |
-| `CODEX_RELAY_UPSTREAM_EXTRA_PARAMS` | _(empty)_ | JSON object merged into each upstream Chat Completions request body |
+| `CODEX_RELAY_OPENCODE_GO_COMPAT` | `false` | Enable OpenCode Go compatibility normalization and schema-reference stripping |
+| `CODEX_RELAY_MAX_REQUEST_BYTES` | `67108864` | Maximum inbound Responses request size |
+| `CODEX_RELAY_UPSTREAM_EXTRA_PARAMS` | _(empty)_ | JSON object merged into each upstream request body |
 | `CODEX_RELAY_DROP_PARAMS` | _(empty)_ | JSON array of top-level upstream request parameter names to remove before forwarding |
 | `CODEX_RELAY_MODEL_MAP` | _(empty)_ | Comma-separated `source:target` model name translations (e.g., `gpt-5.4:deepseek-v4-pro`) |
 | `CODEX_RELAY_TOOL_DENYLIST` | _(empty)_ | Comma-separated tool names to remove before forwarding tools to the upstream model |
@@ -150,6 +166,65 @@ codex-relay --upstream https://api.deepseek.com/v1 --api-key "$DEEPSEEK_API_KEY"
 | `RUST_LOG` | `codex_relay=info` | Log verbosity |
 
 ## Platform quirks
+
+### OpenCode Go compatibility
+
+This opt-in mode sends **all** requests to the configured upstream's native
+`/responses` endpoint instead of translating them to `/chat/completions`. Use
+an upstream and model that support native Responses (for example, Muse on
+OpenCode Go); there is no automatic fallback to Chat Completions.
+
+```bash
+CODEX_RELAY_OPENCODE_GO_COMPAT=true \
+  codex-relay --upstream https://opencode.ai/zen/go/v1 --api-key "$OPENCODE_GO_API_KEY"
+```
+
+The bridge normalizes custom tools to structured functions, flattens namespace
+tools, and bounds upstream tool names to 64 bytes. It restores the original
+client identities on both JSON responses and SSE events, including Codex
+`apply_patch` custom calls and namespace routing. History items, forced
+`tool_choice`, and `allowed_tools` choices use the same mapping. Ambiguous
+names or forced choices targeting unavailable tools return HTTP 422.
+
+Text and reasoning SSE events are forwarded as they arrive, with keepalives
+while the provider is idle. Custom tool arguments are buffered **per tool**
+until complete JSON is available, then emitted as raw custom-input events.
+Malformed/truncated streams produce `response.failed`; unknown or duplicate
+tool calls, including undeclared native call types, are rejected. Hosted search
+calls require a declared and forwarded `web_search_preview` tool. Response usage
+and other provider metadata survive the translation. `apply_patch` descriptions
+retain caller-supplied editing constraints when their transport prose is normalized.
+
+Provider-specific workarounds are limited to this mode:
+
+- Orphan function/custom tool outputs without a `call_id` become explicitly
+  labeled, untrusted **user** messages, never developer/system instructions.
+- JSON Schema `$ref` keywords are removed from tool parameter schemas while
+  preserving sibling constraints, literal property names, and example data.
+  This can broaden the accepted schema: enable it only for an upstream that
+  requires this workaround.
+- Unsupported hosted tools are dropped (`web_search_preview` is preserved).
+- `reasoning.effort=none` is removed while preserving other reasoning fields.
+
+Model mappings, tool denylists, and upstream extra/drop parameters also apply
+in this mode. A tool injected through extra parameters cannot authorize a
+call absent from the original client declarations. Overrides that change the
+client's streaming mode are rejected.
+
+An incoming `x-opencode-session` header (1–256 ASCII bytes) is forwarded.
+Otherwise, each new conversation gets a random identity; a known
+`previous_response_id` reuses its identity. Bindings are held in memory and
+bounded by `--max-sessions` and `--session-ttl-hours`. Clients replaying full
+history without `previous_response_id` should provide the session header to
+retain a provider session. Prompt text is never used as a session identifier.
+Native conversation history remains upstream; the relay's disk history store
+is used only by the Chat Completions path. Corpus recording with
+`--record-corpus` is not supported in native mode and is rejected at startup.
+Normalization logs contain change counts, not request contents or credentials.
+
+The configurable inbound body limit defaults to 64 MiB **in both modes**;
+raise `--max-request-bytes` / `CODEX_RELAY_MAX_REQUEST_BYTES` for larger image
+requests. Requests exceeding the limit return HTTP 413.
 
 Some providers need workarounds that are not part of the Responses ⇄ Chat Completions translation itself. These are registered as named quirks (see `src/quirks.rs` for the full registry, triggers, and removal criteria):
 
@@ -179,6 +254,10 @@ proc.terminate()
 
 Two layers — offline tests pin behavior against captured Codex wire-shape;
 live tests pin behavior against real provider APIs.
+
+Unix shutdown tests launch the real binary and send process signals. On dynamic
+Linux/glibc builds, startup-failure tests also compile a small C fault-injection
+fixture with `cc`; the fixture is loaded only into the test child process.
 
 ## Debugging tool round-trips
 
@@ -221,7 +300,13 @@ The disk backend writes JSON records under:
 ```
 
 Session records contain the translated Chat Completions `messages` retained for
-a response id. Reasoning records keep call-id and turn-fingerprint lookups used
+a response id. New records retain conversation input (including developer/system
+messages) and assistant replies, while excluding the request's top-level
+`instructions`/`system`. Send those top-level instructions again on each request
+where they should apply. Existing records without this separation preserve
+their system content to avoid discarding conversation rules.
+
+Reasoning records keep call-id and turn-fingerprint lookups used
 to round-trip provider reasoning content. The relay keeps only an in-memory
 index for disk-backed entries and loads payloads on demand.
 

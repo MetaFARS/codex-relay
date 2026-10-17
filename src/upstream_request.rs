@@ -30,10 +30,14 @@ impl UpstreamRequestConfig {
     }
 
     pub fn request_body(&self, chat_req: &ChatRequest) -> Result<Value> {
-        let mut body = serde_json::to_value(chat_req)?;
+        self.value_body(serde_json::to_value(chat_req)?)
+    }
+
+    /// Apply the same configured overrides to native Responses requests.
+    pub fn value_body(&self, mut body: Value) -> Result<Value> {
         let object = body
             .as_object_mut()
-            .context("serialized chat request was not a JSON object")?;
+            .context("upstream request body was not a JSON object")?;
 
         for key in &self.drop_params {
             object.remove(key);
@@ -88,6 +92,7 @@ mod tests {
     fn chat_request() -> ChatRequest {
         ChatRequest {
             model: "deepseek-v4-pro".into(),
+            retained_messages: Vec::new(),
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: Some(json!("hello")),

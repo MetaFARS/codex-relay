@@ -1,5 +1,6 @@
 pub mod corpus;
 pub mod dsml;
+pub mod opencode;
 pub mod quirks;
 pub mod session;
 pub mod stream;

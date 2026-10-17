@@ -1,5 +1,6 @@
 mod corpus;
 mod dsml;
+mod opencode;
 mod quirks;
 mod session;
 mod stream;
@@ -11,7 +12,7 @@ mod upstream_request;
 use anyhow::{bail, Context, Result};
 use axum::{
     extract::{DefaultBodyLimit, Request, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -26,6 +27,7 @@ use types::*;
 use upstream_request::UpstreamRequestConfig;
 
 const DEBUG_NAME_LIMIT: usize = 80;
+const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -51,7 +53,19 @@ struct Args {
     #[arg(long, env = "CODEX_RELAY_API_KEY", default_value = "")]
     api_key: String,
 
-    /// JSON object merged into every upstream Chat Completions request body.
+    /// Enable compatibility workarounds for the OpenCode Go Responses endpoint.
+    #[arg(long, env = "CODEX_RELAY_OPENCODE_GO_COMPAT", default_value_t = false)]
+    opencode_go_compat: bool,
+
+    /// Maximum inbound Responses request size in bytes.
+    #[arg(
+        long,
+        env = "CODEX_RELAY_MAX_REQUEST_BYTES",
+        default_value_t = DEFAULT_MAX_REQUEST_BYTES
+    )]
+    max_request_bytes: usize,
+
+    /// JSON object merged into every upstream request body.
     #[arg(long, env = "CODEX_RELAY_UPSTREAM_EXTRA_PARAMS")]
     upstream_extra_params: Option<String>,
 
@@ -123,6 +137,8 @@ struct AppState {
     api_key: Arc<String>,
     upstream_request: Arc<UpstreamRequestConfig>,
     corpus: Option<CorpusRecorder>,
+    opencode_go_compat: bool,
+    opencode_sessions: opencode::SessionRegistry,
 }
 
 #[tokio::main]
@@ -135,6 +151,9 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    if args.opencode_go_compat && args.record_corpus.is_some() {
+        bail!("--record-corpus is not supported with native OpenCode Go Responses; disable recording or compatibility mode");
+    }
 
     let upstream = validate_upstream(&args.upstream)?;
     let upstream_request = Arc::new(UpstreamRequestConfig::from_raw(
@@ -205,6 +224,8 @@ async fn main() -> Result<()> {
         api_key: api_key.clone(),
         upstream_request: upstream_request.clone(),
         corpus,
+        opencode_go_compat: args.opencode_go_compat,
+        opencode_sessions: opencode::SessionRegistry::new(args.max_sessions, session_ttl),
     };
     info!(
         "session retention: store={} dir={} ttl={}h max_sessions={} max_session_memory={} MiB",
@@ -221,22 +242,23 @@ async fn main() -> Result<()> {
             upstream_request.drop_param_count()
         );
     }
+    if args.opencode_go_compat {
+        info!("OpenCode Go compatibility enabled");
+    }
 
     // Fetch upstream model list asynchronously for user visibility
     tokio::spawn(log_upstream_models(client, Arc::new(upstream), api_key));
 
     tokio::spawn(cleanup_sessions(state.sessions.clone()));
 
-    // Disable axum's default 2 MiB body cap: Codex CLI may send base64-encoded
-    // image attachments that easily exceed it, and a framework-level 413 looks
-    // like a transport-layer death to Codex and crashes the session (#2).
-    // The relay binds 127.0.0.1 by default; --bind can expose it more widely,
-    // so be mindful of DoS when binding to a non-loopback address.
+    // Codex CLI may send base64-encoded image attachments that exceed Axum's
+    // default 2 MiB cap, but an unlimited body is an avoidable DoS risk when
+    // --bind exposes the listener beyond localhost. Keep the cap configurable.
     let app = Router::new()
         .route("/v1/responses", post(handle_responses))
         .route("/v1/models", get(handle_models))
         .fallback(handle_fallback)
-        .layer(DefaultBodyLimit::disable())
+        .layer(DefaultBodyLimit::max(args.max_request_bytes))
         .with_state(state.clone());
 
     let addr = std::net::SocketAddr::new(args.bind, args.port);
@@ -755,18 +777,16 @@ fn chat_response_tool_call_debug_names(chat_resp: &ChatResponse) -> Vec<String> 
         .collect()
 }
 
-async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
+async fn handle_responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
     let req: ResponsesRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(e) => {
-            error!(
-                error_category = ?e.classify(),
-                line = e.line(),
-                column = e.column(),
-                body_bytes = body.len(),
-                "JSON parse error"
-            );
-            return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response();
+        Ok(req) => req,
+        Err(error) => {
+            error!(error_category = ?error.classify(), line = error.line(), column = error.column(), body_bytes = body.len(), "request parse error");
+            return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response();
         }
     };
     debug!(
@@ -785,7 +805,119 @@ async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes
         summarize_debug_names(response_tool_debug_names(&req.tools))
     );
 
+    if state.opencode_go_compat {
+        let payload = match serde_json::from_slice(&body) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response()
+            }
+        };
+        return handle_opencode_responses(state, payload, req, headers).await;
+    }
     handle_responses_inner(state, req).await
+}
+
+async fn handle_opencode_responses(
+    state: AppState,
+    mut payload: serde_json::Value,
+    req: ResponsesRequest,
+    headers: HeaderMap,
+) -> Response {
+    payload["model"] = serde_json::json!(translate::map_model_name(&req.model));
+    let payload = match state.upstream_request.value_body(payload) {
+        Ok(payload) => payload,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    };
+    if payload
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        != req.stream
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "upstream overrides must not change stream mode",
+        )
+            .into_response();
+    }
+    let prepared = match opencode::PreparedRequest::new(payload, &req.tools) {
+        Ok(prepared) => prepared,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    };
+    debug!(
+        orphan_outputs = prepared.changes.orphan_outputs,
+        schema_refs = prepared.changes.schema_refs,
+        tool_fields = prepared.changes.tool_fields,
+        "OpenCode Go normalization"
+    );
+    let session = match headers.get("x-opencode-session") {
+        Some(header) => match header
+            .to_str()
+            .ok()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.len() <= 256)
+        {
+            Some(session) => session.to_owned(),
+            None => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "x-opencode-session must be 1 to 256 ASCII bytes",
+                )
+                    .into_response()
+            }
+        },
+        None => state.opencode_sessions.session_for_request(
+            prepared
+                .payload
+                .get("previous_response_id")
+                .and_then(serde_json::Value::as_str),
+        ),
+    };
+    let url = format!("{}responses", join_base(&state.upstream));
+    let mut builder = state
+        .client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header(
+            "Accept",
+            if req.stream {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+        )
+        .header(
+            "User-Agent",
+            format!("codex-relay/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .header("x-opencode-session", &session);
+    if !state.api_key.is_empty() {
+        builder = builder.bearer_auth(state.api_key.as_str());
+    }
+    for name in ["OpenAI-Beta", "OpenAI-Organization", "OpenAI-Project"] {
+        if let Some(value) = headers.get(name) {
+            builder = builder.header(name, value);
+        }
+    }
+    let builder = builder.json(&prepared.payload);
+    if req.stream {
+        opencode::forward_stream(
+            builder,
+            prepared.tools,
+            req.model,
+            state.opencode_sessions,
+            session,
+        )
+    } else {
+        opencode::forward_json(
+            builder,
+            prepared.tools,
+            &req.model,
+            &state.opencode_sessions,
+            &session,
+        )
+        .await
+    }
 }
 
 async fn handle_responses_inner(state: AppState, mut req: ResponsesRequest) -> Response {

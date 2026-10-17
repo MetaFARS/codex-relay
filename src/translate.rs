@@ -329,7 +329,7 @@ pub fn to_chat_request(
 /// Map model names via `CODEX_RELAY_MODEL_MAP` env var.
 /// Format: `source-model:target-model,source2:target2`
 /// Example: `CODEX_RELAY_MODEL_MAP="gpt-5.4:deepseek-v4-pro,gpt-5.5:deepseek-v4-pro"`
-fn map_model_name(name: &str) -> String {
+pub(crate) fn map_model_name(name: &str) -> String {
     if let Ok(map_str) = std::env::var("CODEX_RELAY_MODEL_MAP") {
         for pair in map_str.split(',') {
             let mut parts = pair.splitn(2, ':');
@@ -520,7 +520,7 @@ fn complete_message_tool_arguments(message: &mut ChatMessage) {
     }
 }
 
-fn declared_function_name(tool: &Value) -> Option<&str> {
+pub(crate) fn declared_function_name(tool: &Value) -> Option<&str> {
     tool.get("function")
         .unwrap_or(tool)
         .get("name")
@@ -539,11 +539,11 @@ fn string_field_from_parameters(parameters: &Value) -> Option<String> {
     (schema.get("type").and_then(Value::as_str) == Some("string")).then(|| field.clone())
 }
 
-fn function_tool_string_field(tool: &Value) -> Option<String> {
+pub(crate) fn function_tool_string_field(tool: &Value) -> Option<String> {
     string_field_from_parameters(tool.get("function").unwrap_or(tool).get("parameters")?)
 }
 
-fn apply_patch_chat_description(argument_field: &str, original: Option<&str>) -> String {
+pub(crate) fn apply_patch_chat_description(argument_field: &str, original: Option<&str>) -> String {
     let mut description = format!(
         "Apply a Codex patch. Use this as a normal function tool and pass the complete \
 patch text in the `{argument_field}` string argument.
@@ -583,6 +583,7 @@ Omit context lines when changed lines uniquely locate the edit."
         "This is a FREEFORM tool...",
         "This is a FREEFORM tool.",
         "Do not wrap the patch in JSON.",
+        "FREEFORM: do not use JSON",
     ] {
         let lower = additional.to_ascii_lowercase();
         for (start, matched) in lower
@@ -601,7 +602,7 @@ Omit context lines when changed lines uniquely locate the edit."
     description
 }
 
-fn custom_argument_field(name: &str) -> &'static str {
+pub(crate) fn custom_argument_field(name: &str) -> &'static str {
     if name == "apply_patch" {
         "patch"
     } else {
@@ -616,7 +617,7 @@ pub(crate) fn custom_tool_input(arguments: &str, argument_field: &str) -> String
         .unwrap_or_else(|| arguments.to_string())
 }
 
-fn tool_denylist_from_env() -> HashSet<String> {
+pub(crate) fn tool_denylist_from_env() -> HashSet<String> {
     std::env::var("CODEX_RELAY_TOOL_DENYLIST")
         .unwrap_or_default()
         .split(',')

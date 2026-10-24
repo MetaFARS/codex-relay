@@ -2727,3 +2727,113 @@ async fn mistral_structured_content_stream_keeps_tool_calls_and_string_deltas() 
     assert_eq!(tool_item["name"], "shell");
     assert_eq!(tool_item["arguments"], "{\"cmd\":\"ls\"}");
 }
+
+/// Two-turn round trip with Mistral-hosted GLM reasoning: turn 1 streams
+/// structured thinking blocks and a tool call; turn 2 replays the assistant
+/// history (reasoning + tool call + tool result). The upstream request must
+/// carry the replayed assistant turn with reasoning_content and intact
+/// tool-call wiring on non-Mistral hosts (the mock's localhost is not
+/// mistral.ai) — that field is exactly what Mistral rejects with 422
+/// extra_forbidden; the mistral_reasoning_content quirk strips it at
+/// translation for Mistral hosts (unit-covered on
+/// to_chat_request_with_upstream, which the e2e harness cannot point at a
+/// fake mistral.ai host).
+#[tokio::test]
+async fn mistral_two_turn_history_replays_reasoning_and_tool_calls() {
+    let turn1_sse = sse_from_chunks(vec![
+        json!({"choices":[{"delta":{"role":"assistant","content":[]}}]}),
+        json!({"choices":[{"delta":{"content":[
+            {"type":"thinking","thinking":[{"type":"text","text":"need a listing"}],"closed":true}
+        ]}}]}),
+        json!({"choices":[{"delta":{
+            "tool_calls":[{"index":0,"id":"call_t1","function":{"name":"shell","arguments":"{\"cmd\":\"ls\"}"}}]
+        }}]}),
+        json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}],
+               "usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}}),
+    ]);
+    let turn2_sse = sse_from_chunks(vec![
+        json!({"choices":[{"delta":{"role":"assistant","content":"2 files."}}]}),
+        json!({"choices":[{"delta":{},"finish_reason":"stop"}],
+               "usage":{"prompt_tokens":15,"completion_tokens":3,"total_tokens":18}}),
+    ]);
+    let (upstream_port, bodies) =
+        spawn_mock_upstream_with_responses(vec![turn1_sse, turn2_sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let tools = json!([{"type": "function", "name": "shell", "parameters": {"type": "object"}}]);
+    let first = post_stream_completed(
+        &relay,
+        json!({
+            "model": "zai-glm-5-3-flash",
+            "input": "list the files",
+            "tools": tools,
+            "stream": true
+        }),
+    )
+    .await;
+
+    // Turn 1: thinking block -> reasoning item; tool call emitted after it.
+    let output1 = first["response"]["output"].as_array().unwrap();
+    let reasoning = output1
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .map(|item| {
+            item["summary"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        })
+        .unwrap_or_default();
+    assert_eq!(reasoning, "need a listing");
+    let call_id = output1
+        .iter()
+        .find_map(|item| {
+            (item["type"] == "function_call")
+                .then(|| item["call_id"].as_str().unwrap_or("").to_string())
+        })
+        .expect("function_call item");
+    assert_eq!(call_id, "call_t1");
+
+    // Turn 2: same session via previous_response_id, tool result included.
+    let completed2 = post_stream_completed(
+        &relay,
+        json!({
+            "model": "zai-glm-5-3-flash",
+            "input": [
+                {"type": "function_call_output", "call_id": call_id, "output": "a.txt\nb.txt"}
+            ],
+            "tools": tools,
+            "previous_response_id": first["response"]["id"].as_str().unwrap_or(""),
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(
+        completed2["response"]["output"][0]["content"][0]["text"],
+        "2 files."
+    );
+
+    // The turn-2 upstream request replays the assistant turn with the
+    // reasoning_content from turn 1, the original tool call, and the tool
+    // result, in order.
+    let request_bodies = bodies.lock().unwrap();
+    let turn2_body = request_bodies.last().expect("turn 2 upstream body");
+    let messages = turn2_body["messages"].as_array().expect("messages");
+    let assistant = messages
+        .iter()
+        .find(|m| m["role"] == "assistant" && m["tool_calls"].is_array())
+        .expect("replayed assistant turn");
+    assert_eq!(
+        assistant["reasoning_content"],
+        json!("need a listing"),
+        "non-Mistral upstreams must keep replayed reasoning_content (this is the field Mistral rejects; stripped for mistral hosts at translation)"
+    );
+    assert_eq!(assistant["tool_calls"][0]["id"], "call_t1");
+    assert_eq!(assistant["tool_calls"][0]["function"]["name"], "shell");
+    let tool_msg = messages
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("tool result message");
+    assert_eq!(tool_msg["tool_call_id"], "call_t1");
+    assert_eq!(tool_msg["content"], "a.txt\nb.txt");
+}

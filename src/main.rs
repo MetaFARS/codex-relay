@@ -379,28 +379,25 @@ async fn print_codex_config(
         builder = builder.bearer_auth(api_key);
     }
 
-    let models: Vec<String> = match builder.send().await {
+    let models: Vec<UpstreamModelInfo> = match builder.send().await {
         Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
-            Ok(body) => body
-                .get("data")
-                .or_else(|| body.get("models"))
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            Ok(body) => upstream_models_from_response(&body),
             Err(e) => {
                 eprintln!("// Failed to parse upstream models: {e}");
                 eprintln!("// Falling back to a generic snippet. Replace <YOUR_MODEL> below.");
-                vec!["<YOUR_MODEL>".into()]
+                vec![UpstreamModelInfo {
+                    id: "<YOUR_MODEL>".into(),
+                    max_context_length: None,
+                }]
             }
         },
         status => {
             eprintln!("// Failed to fetch upstream models (status: {status:?})");
             eprintln!("// Falling back to a generic snippet. Replace <YOUR_MODEL> below.");
-            vec!["<YOUR_MODEL>".into()]
+            vec![UpstreamModelInfo {
+                id: "<YOUR_MODEL>".into(),
+                max_context_length: None,
+            }]
         }
     };
 
@@ -412,8 +409,8 @@ async fn print_codex_config(
             .with_context(|| format!("failed to write model catalog to {}", path.display()))?;
     }
 
-    let model = if !models.is_empty() && !models[0].starts_with('<') {
-        Some(models[0].as_str())
+    let model = if !models.is_empty() && !models[0].id.starts_with('<') {
+        Some(models[0].id.as_str())
     } else {
         None
     };
@@ -524,7 +521,7 @@ fn load_bundled_codex_catalog() -> Result<serde_json::Value> {
 
 fn build_model_catalog(
     mut catalog: serde_json::Value,
-    upstream_models: &[String],
+    upstream_models: &[UpstreamModelInfo],
     template_slug: Option<&str>,
     provider_name: &str,
 ) -> Result<serde_json::Value> {
@@ -551,14 +548,15 @@ fn build_model_catalog(
             .context("the installed Codex CLI returned an empty bundled catalog")?
     };
 
-    for (index, slug) in upstream_models.iter().enumerate() {
+    for (index, upstream_model) in upstream_models.iter().enumerate() {
+        let slug = &upstream_model.id;
         if slug.starts_with('<') {
             continue;
         }
         let existing_index = models
             .iter()
             .position(|model| model.get("slug").and_then(serde_json::Value::as_str) == Some(slug));
-        let props = estimate_model_properties(slug);
+        let props = estimate_model_properties(slug, upstream_model.max_context_length);
         let mut model = template.clone();
         let object = model
             .as_object_mut()
@@ -659,10 +657,57 @@ struct ModelProps {
     supports_reasoning_summaries: bool,
 }
 
+/// An upstream model as reported by its `/v1/models` endpoint, with the
+/// metadata the Codex catalog needs. Context-window field names differ by
+/// provider: Mistral reports `max_context_length`, OpenRouter
+/// `context_length`; many OpenAI-compatible providers report neither.
+#[derive(Debug, Clone)]
+struct UpstreamModelInfo {
+    id: String,
+    max_context_length: Option<u64>,
+}
+
+/// Extract the usable context-window size from one upstream model entry.
+/// Absent, non-integer, and zero values are treated as unknown so the
+/// heuristic estimate stays in charge instead of fabricating a window.
+fn upstream_context_length(model: &serde_json::Value) -> Option<u64> {
+    ["max_context_length", "context_length"]
+        .iter()
+        .find_map(|key| model.get(*key).and_then(serde_json::Value::as_u64))
+        .filter(|length| *length > 0)
+}
+
+/// Parse a `/v1/models` response body (legacy `{data:[...]}` and Codex-style
+/// `{models:[...]}` shapes) into the upstream model list.
+fn upstream_models_from_response(body: &serde_json::Value) -> Vec<UpstreamModelInfo> {
+    body.get("data")
+        .or_else(|| body.get("models"))
+        .and_then(serde_json::Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|model| {
+                    let id = model.get("id").and_then(serde_json::Value::as_str)?;
+                    Some(UpstreamModelInfo {
+                        id: id.to_string(),
+                        max_context_length: upstream_context_length(model),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Heuristic-based model property estimation.
 /// Providers don't expose context window sizes in their /v1/models endpoint,
 /// so we use conservative defaults based on model family name.
-fn estimate_model_properties(model_id: &str) -> ModelProps {
+///
+/// When the upstream *does* report a context length, it wins: the provider's
+/// own metadata is authoritative and the heuristic exists only for providers
+/// that report nothing. Codex derives its remaining-context display from
+/// `context_window`, so an underestimated window makes Codex clamp "context
+/// left" to 0% long before the model is actually full.
+fn estimate_model_properties(model_id: &str, upstream_context: Option<u64>) -> ModelProps {
     let lower = model_id.to_lowercase();
 
     // Reasoning models (DeepSeek-R1, kimi-k2.6, etc.)
@@ -674,7 +719,7 @@ fn estimate_model_properties(model_id: &str) -> ModelProps {
         || lower.contains("deepseek-v4");
 
     // Context window estimation by family
-    let (ctx, max_ctx) = if lower.contains("gpt-5") {
+    let (heuristic_ctx, heuristic_max_ctx) = if lower.contains("gpt-5") {
         (272_000, 1_000_000)
     } else if lower.contains("gpt-4.5") || lower.contains("gpt-4o") {
         (128_000, 128_000)
@@ -698,9 +743,13 @@ fn estimate_model_properties(model_id: &str) -> ModelProps {
         (128_000, 128_000)
     };
 
+    let upstream = upstream_context.filter(|length| *length <= u64::from(u32::MAX));
+    let context_window = upstream.unwrap_or(heuristic_ctx) as u32;
+    let max_context_window = upstream.unwrap_or(heuristic_max_ctx) as u32;
+
     ModelProps {
-        context_window: ctx,
-        max_context_window: max_ctx,
+        context_window,
+        max_context_window,
         supports_parallel_tool_calls: true,
         supports_reasoning_summaries: has_reasoning,
     }
@@ -2082,7 +2131,7 @@ mod tests {
 
     #[test]
     fn test_estimate_model_properties_deepseek() {
-        let props = estimate_model_properties("deepseek-v4-pro");
+        let props = estimate_model_properties("deepseek-v4-pro", None);
         assert_eq!(props.context_window, 262_144);
         assert_eq!(props.max_context_window, 1_048_576);
         assert!(props.supports_reasoning_summaries);
@@ -2091,17 +2140,153 @@ mod tests {
 
     #[test]
     fn test_estimate_model_properties_deepseek_r1() {
-        let props = estimate_model_properties("deepseek-r1");
+        let props = estimate_model_properties("deepseek-r1", None);
         assert!(props.supports_reasoning_summaries);
     }
 
     #[test]
     fn test_estimate_model_properties_unknown() {
-        let props = estimate_model_properties("some-unknown-model");
+        let props = estimate_model_properties("some-unknown-model", None);
         assert_eq!(props.context_window, 128_000);
         assert_eq!(props.max_context_window, 128_000);
         assert!(!props.supports_reasoning_summaries);
         assert!(props.supports_parallel_tool_calls);
+    }
+
+    #[test]
+    fn upstream_context_metadata_overrides_the_heuristic() {
+        // Regression: Mistral reports `max_context_length: 1048576` for
+        // zai-glm-5-3-flash, but the generated catalog used to carry the
+        // heuristic default of 128000. Codex then clamped "context left" to
+        // 0% once the real prompt outgrew the invented window.
+        let props = estimate_model_properties("zai-glm-5-3-flash", Some(1_048_576));
+        assert_eq!(props.context_window, 1_048_576);
+        assert_eq!(props.max_context_window, 1_048_576);
+    }
+
+    #[test]
+    fn upstream_context_larger_than_u32_is_rejected() {
+        // A nonsensical upstream value must not overflow the catalog's u32.
+        let props = estimate_model_properties("zai-glm-5-3-flash", Some(u64::from(u32::MAX) + 1));
+        assert_eq!(props.context_window, 128_000);
+        assert_eq!(props.max_context_window, 128_000);
+    }
+
+    #[test]
+    fn upstream_context_length_field_shapes() {
+        // Mistral shape.
+        assert_eq!(
+            upstream_context_length(&json!({"max_context_length": 1_048_576})),
+            Some(1_048_576)
+        );
+        // OpenRouter shape.
+        assert_eq!(
+            upstream_context_length(&json!({"context_length": 65_536})),
+            Some(65_536)
+        );
+        // max_context_length wins when a provider reports both.
+        assert_eq!(
+            upstream_context_length(&json!({"max_context_length": 8_192, "context_length": 4_096})),
+            Some(8_192)
+        );
+        // Unusable values degrade to unknown, never to a fabricated window.
+        assert_eq!(upstream_context_length(&json!({})), None);
+        assert_eq!(
+            upstream_context_length(&json!({"max_context_length": null})),
+            None
+        );
+        assert_eq!(
+            upstream_context_length(&json!({"max_context_length": 0})),
+            None
+        );
+        assert_eq!(
+            upstream_context_length(&json!({"max_context_length": "1m"})),
+            None
+        );
+        assert_eq!(
+            upstream_context_length(&json!({"max_context_length": 1.5})),
+            None
+        );
+    }
+
+    #[test]
+    fn upstream_models_from_response_parses_both_list_shapes() {
+        let legacy = json!({"data": [
+            {"id": "zai-glm-5-3-flash", "max_context_length": 1_048_576},
+            {"id": "mistral-large", "max_context_length": 131_072}
+        ]});
+        let models = upstream_models_from_response(&legacy);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "zai-glm-5-3-flash");
+        assert_eq!(models[0].max_context_length, Some(1_048_576));
+
+        let codex_style = json!({"models": [{"id": "plain-model"}]});
+        let models = upstream_models_from_response(&codex_style);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "plain-model");
+        assert_eq!(models[0].max_context_length, None);
+
+        // Entries without an id and unusable bodies yield nothing usable.
+        assert!(upstream_models_from_response(&json!({"data": [{"name": "no-id"}]})).is_empty());
+        assert!(upstream_models_from_response(&json!({"error": "denied"})).is_empty());
+    }
+
+    #[test]
+    fn catalog_generation_uses_upstream_context_metadata() {
+        // Regression for the "Context 0% left" display: the generated catalog
+        // entry must carry the provider-reported window, not the heuristic.
+        let bundled = serde_json::json!({
+            "models": [{
+                "slug": "codex-template",
+                "display_name": "Codex Template",
+                "visibility": "list",
+                "context_window": 272_000,
+                "max_context_window": 872_000,
+                "effective_context_window_percent": 95
+            }]
+        });
+
+        let catalog = build_model_catalog(
+            bundled,
+            &[
+                UpstreamModelInfo {
+                    id: "zai-glm-5-3-flash".into(),
+                    max_context_length: Some(1_048_576),
+                },
+                // No context metadata reported: heuristic fallback, unchanged.
+                UpstreamModelInfo {
+                    id: "zai-glm-5-3-mini".into(),
+                    max_context_length: None,
+                },
+            ],
+            Some("codex-template"),
+            "mistral",
+        )
+        .unwrap();
+        let models = catalog["models"].as_array().unwrap();
+
+        let glm = models
+            .iter()
+            .find(|m| m["slug"] == "zai-glm-5-3-flash")
+            .unwrap();
+        assert_eq!(glm["context_window"], 1_048_576);
+        assert_eq!(glm["max_context_window"], 1_048_576);
+        // Template-inherited fields survive.
+        assert_eq!(glm["effective_context_window_percent"], 95);
+
+        let unknown = models
+            .iter()
+            .find(|m| m["slug"] == "zai-glm-5-3-mini")
+            .unwrap();
+        assert_eq!(unknown["context_window"], 128_000);
+        assert_eq!(unknown["max_context_window"], 128_000);
+
+        // The bundled template itself is preserved untouched.
+        let template = models
+            .iter()
+            .find(|m| m["slug"] == "codex-template")
+            .unwrap();
+        assert_eq!(template["context_window"], 272_000);
     }
 
     #[test]
@@ -2243,7 +2428,10 @@ mod tests {
 
         let catalog = build_model_catalog(
             bundled,
-            &["deepseek-r1".into()],
+            &[UpstreamModelInfo {
+                id: "deepseek-r1".into(),
+                max_context_length: None,
+            }],
             Some("codex-template"),
             "provider",
         )
@@ -2292,7 +2480,10 @@ mod tests {
 
         let catalog = build_model_catalog(
             bundled,
-            &["same-model".into()],
+            &[UpstreamModelInfo {
+                id: "same-model".into(),
+                max_context_length: None,
+            }],
             Some("same-model"),
             "provider",
         )
@@ -2314,8 +2505,16 @@ mod tests {
             "slug": "known",
             "visibility": "list"
         }]});
-        let error = build_model_catalog(bundled, &["upstream".into()], Some("missing"), "provider")
-            .unwrap_err();
+        let error = build_model_catalog(
+            bundled,
+            &[UpstreamModelInfo {
+                id: "upstream".into(),
+                max_context_length: None,
+            }],
+            Some("missing"),
+            "provider",
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("was not found"));
     }
 }

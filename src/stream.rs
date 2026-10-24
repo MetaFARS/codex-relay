@@ -245,17 +245,25 @@ pub fn translate_stream(
                                 // isolate DSML before healing visible reasoning.
                                 // This matches the blocking translation order.
                                 let dsml_content = dsml_filter
-                                    .push(choice.delta.content.as_deref().unwrap_or(""));
+                                    .push(choice.delta.content_text().as_deref().unwrap_or(""));
                                 let think = think_filter.push(&dsml_content);
-                                // Reasoning/thinking content (kimi-k2.6, GLM, etc.).
-                                // Field name varies by provider (reasoning_content
-                                // vs reasoning) — normalized via reasoning_text().
+                                // Reasoning/thinking content arrives on three
+                                // channels: the native `reasoning_content` /
+                                // `reasoning` fields (kimi-k2.6, GLM native),
+                                // `thinking` blocks inside structured content
+                                // (Mistral-hosted GLM), and ` threshin>` markup healed
+                                // out of the text stream (quirk think_tags).
+                                // Structured thinking is part of the content
+                                // stream, so it precedes the healed text.
                                 {
-                                    let reasoning_delta = match choice.delta.reasoning_text() {
-                                        Some(native) if think.reasoning.is_empty() => native.to_string(),
-                                        Some(native) => format!("{native}{}", think.reasoning),
-                                        None => think.reasoning.clone(),
-                                    };
+                                    let mut reasoning_delta = String::new();
+                                    if let Some(native) = choice.delta.reasoning_text() {
+                                        reasoning_delta.push_str(native);
+                                    }
+                                    if let Some(structured) = choice.delta.thinking_text() {
+                                        reasoning_delta.push_str(&structured);
+                                    }
+                                    reasoning_delta.push_str(&think.reasoning);
                                     let rc = reasoning_delta.as_str();
                                     if !rc.is_empty() {
                                         reasoning_chunks += 1;

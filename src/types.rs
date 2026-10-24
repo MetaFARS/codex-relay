@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 
 // ── Responses API (inbound from Codex CLI) ──────────────────────────────────
 
@@ -249,7 +250,12 @@ pub struct ChatStreamChoice {
 pub struct ChatDelta {
     #[allow(dead_code)]
     pub role: Option<String>,
-    pub content: Option<String>,
+    /// Streamed content. OpenAI-compatible providers send a plain string;
+    /// Mistral-hosted GLM sends an array of structured blocks whose `text`
+    /// parts carry the answer and `thinking` parts carry reasoning. Normalized
+    /// via [`ChatDelta::content_text`] and [`ChatDelta::thinking_text`].
+    #[serde(default)]
+    pub content: Option<DeltaContent>,
     /// Thinking content. Providers disagree on the field name: DeepSeek/Kimi/GLM
     /// use `reasoning_content`; OpenRouter/Together-style (and some newer GLM-5
     /// deployments) use `reasoning`. Capture both and normalize via
@@ -262,6 +268,51 @@ pub struct ChatDelta {
     pub tool_calls: Option<Vec<DeltaToolCall>>,
 }
 
+/// Upstream `delta.content` shape.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum DeltaContent {
+    /// `content: "text"` — the common Chat Completions shape.
+    Text(String),
+    /// `content: [{type: "text"|"thinking", ...}, ...]` — Mistral-style
+    /// structured blocks (Mistral-hosted GLM).
+    Blocks(Vec<DeltaBlock>),
+}
+
+/// One structured block inside a `delta.content` array.
+///
+/// Unknown block kinds and extra fields (e.g. Mistral's `closed`) are ignored,
+/// so a provider adding new block types cannot break stream deserialization.
+#[derive(Debug, Deserialize)]
+pub struct DeltaBlock {
+    /// Block kind: `"text"` (visible output) or `"thinking"` (reasoning).
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    /// Visible text payload of a `text` block.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Reasoning payload of a `thinking` block. Mistral nests text items
+    /// (`thinking: [{type: "text", text: "..."}]`); GLM's native API sends a
+    /// plain string. Both shapes are accepted.
+    #[serde(default)]
+    pub thinking: Option<ThinkingPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ThinkingPayload {
+    /// `thinking: "reasoning text"`
+    Text(String),
+    /// `thinking: [{type: "text", text: "reasoning text"}, ...]`
+    Items(Vec<ThinkingItem>),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ThinkingItem {
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
 impl ChatDelta {
     /// Normalized reasoning delta, preferring `reasoning_content` and falling
     /// back to the `reasoning` alias.
@@ -269,6 +320,54 @@ impl ChatDelta {
         self.reasoning_content
             .as_deref()
             .or(self.reasoning.as_deref())
+    }
+
+    /// Visible text carried by this delta: the plain string shape, or the
+    /// concatenation of `text` blocks from the structured shape. `None` when
+    /// the delta carries no visible text.
+    pub fn content_text(&self) -> Option<Cow<'_, str>> {
+        match self.content.as_ref()? {
+            DeltaContent::Text(text) => Some(Cow::Borrowed(text)),
+            DeltaContent::Blocks(blocks) => {
+                let mut joined = String::new();
+                for block in blocks {
+                    if block.kind.as_deref() == Some("text") {
+                        if let Some(text) = &block.text {
+                            joined.push_str(text);
+                        }
+                    }
+                }
+                (!joined.is_empty()).then_some(Cow::Owned(joined))
+            }
+        }
+    }
+
+    /// Reasoning text carried inside structured `thinking` blocks
+    /// (Mistral-hosted GLM). `None` for plain-string content and for deltas
+    /// without thinking payloads.
+    pub fn thinking_text(&self) -> Option<String> {
+        let blocks = match self.content.as_ref()? {
+            DeltaContent::Blocks(blocks) => blocks,
+            DeltaContent::Text(_) => return None,
+        };
+        let mut joined = String::new();
+        for block in blocks {
+            if block.kind.as_deref() != Some("thinking") {
+                continue;
+            }
+            match &block.thinking {
+                Some(ThinkingPayload::Text(text)) => joined.push_str(text),
+                Some(ThinkingPayload::Items(items)) => {
+                    for item in items {
+                        if let Some(text) = &item.text {
+                            joined.push_str(text);
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        (!joined.is_empty()).then_some(joined)
     }
 }
 
@@ -291,7 +390,7 @@ pub struct DeltaFunction {
 
 #[cfg(test)]
 mod tests {
-    use super::ChatUsage;
+    use super::{ChatDelta, ChatStreamChunk, ChatUsage};
     use serde_json::json;
 
     #[test]
@@ -353,5 +452,140 @@ mod tests {
         let usage = ChatUsage::default();
 
         assert_eq!(usage.cache_summary(), "hit=0 miss=0 prompt=0 hit_rate=0.0%");
+    }
+
+    #[test]
+    fn delta_accepts_plain_string_content() {
+        let delta: ChatDelta = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": "hello world"
+        }))
+        .unwrap();
+
+        assert_eq!(delta.content_text().as_deref(), Some("hello world"));
+        assert_eq!(delta.thinking_text(), None);
+    }
+
+    #[test]
+    fn delta_accepts_mistral_thinking_blocks() {
+        // Exact delta shape from the Mistral-hosted GLM failure report, which
+        // previously failed deserialization with
+        // "invalid type: sequence, expected a string".
+        let delta: ChatDelta = serde_json::from_value(json!({
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": [{"type": "text", "text": "The"}],
+                    "closed": true
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(delta.thinking_text().as_deref(), Some("The"));
+        assert_eq!(delta.content_text(), None);
+    }
+
+    #[test]
+    fn delta_accepts_mistral_text_blocks() {
+        let delta: ChatDelta = serde_json::from_value(json!({
+            "content": [{"type": "text", "text": "visible answer"}]
+        }))
+        .unwrap();
+
+        assert_eq!(delta.content_text().as_deref(), Some("visible answer"));
+        assert_eq!(delta.thinking_text(), None);
+    }
+
+    #[test]
+    fn delta_mixed_blocks_map_text_and_thinking_separately() {
+        let delta: ChatDelta = serde_json::from_value(json!({
+            "content": [
+                {"type": "thinking", "thinking": [{"type": "text", "text": "ponder"}]},
+                {"type": "text", "text": "vis"},
+                {"type": "thinking", "thinking": [{"type": "text", "text": " more"}]},
+                {"type": "text", "text": "ible"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(delta.content_text().as_deref(), Some("visible"));
+        assert_eq!(delta.thinking_text().as_deref(), Some("ponder more"));
+    }
+
+    #[test]
+    fn delta_thinking_block_accepts_string_payload() {
+        // GLM's native API nests a plain string instead of text items.
+        let delta: ChatDelta = serde_json::from_value(json!({
+            "content": [{"type": "thinking", "thinking": "reasoning text"}]
+        }))
+        .unwrap();
+
+        assert_eq!(delta.thinking_text().as_deref(), Some("reasoning text"));
+        assert_eq!(delta.content_text(), None);
+    }
+
+    #[test]
+    fn delta_ignores_unknown_block_kinds_and_extra_fields() {
+        let delta: ChatDelta = serde_json::from_value(json!({
+            "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.invalid/x.png"}},
+                {"type": "text", "text": "kept", "unknown_future_field": true}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(delta.content_text().as_deref(), Some("kept"));
+        assert_eq!(delta.thinking_text(), None);
+    }
+
+    #[test]
+    fn delta_missing_or_null_content_yields_nothing() {
+        let delta: ChatDelta = serde_json::from_value(json!({"role": "assistant"})).unwrap();
+        assert_eq!(delta.content_text(), None);
+        assert_eq!(delta.thinking_text(), None);
+
+        let delta: ChatDelta = serde_json::from_value(json!({"content": null})).unwrap();
+        assert_eq!(delta.content_text(), None);
+    }
+
+    #[test]
+    fn mistral_stream_chunk_with_structured_content_deserializes() {
+        let chunk: ChatStreamChunk = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": [{"type": "text", "text": "The"}],
+                            "closed": true
+                        }
+                    ]
+                },
+                "finish_reason": null
+            }]
+        }))
+        .unwrap();
+
+        let delta = &chunk.choices[0].delta;
+        assert_eq!(delta.thinking_text().as_deref(), Some("The"));
+        assert_eq!(delta.content_text(), None);
+    }
+
+    #[test]
+    fn delta_tool_calls_survive_alongside_structured_content() {
+        let delta: ChatDelta = serde_json::from_value(json!({
+            "content": [{"type": "text", "text": ""}],
+            "tool_calls": [{
+                "index": 0,
+                "id": "call_1",
+                "function": {"name": "shell", "arguments": "{\"cmd\":\"ls\"}"}
+            }]
+        }))
+        .unwrap();
+
+        assert!(delta.tool_calls.is_some());
+        assert_eq!(delta.tool_calls.unwrap()[0].id.as_deref(), Some("call_1"));
     }
 }

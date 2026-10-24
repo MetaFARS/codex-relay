@@ -32,7 +32,7 @@
 //!
 //! | name           | class | trigger                                   | remove when |
 //! |----------------|-------|-------------------------------------------|-------------|
-//! | `glm_thinking` | A     | model name looks like GLM/Zhipu           | GLM emits reasoning_content without the explicit `thinking` switch (issue #26) |
+//! | `glm_thinking` | A     | model name looks like GLM/Zhipu and the upstream is not Mistral | GLM emits reasoning_content without the explicit `thinking` switch (issue #26) |
 //! | `dsml_heal`    | B     | leaked `<｜DSML｜` markup in text content  | DeepSeek V4 stops leaking DSML (vllm-project/vllm#40801) and telemetry shows no firings for ~a month |
 //! | `missing_done` | B     | SSE stream closes cleanly without `[DONE]`| providers terminate streams spec-compliantly (issue #31) |
 //! | `think_tags`   | B     | `<think>` markup leaked into text content  | providers deploy reasoning models with a matching vLLM `--reasoning-parser` so thinking arrives in `reasoning_content` |
@@ -72,6 +72,18 @@ pub fn is_glm_like_model(model: &str) -> bool {
     m.contains("glm") || m.contains("zhipu") || m.contains("bigmodel")
 }
 
+/// Whether the upstream is Mistral's hosted API (api.mistral.ai,
+/// codestral.mistral.ai, …). Mistral rejects the GLM top-level `thinking`
+/// switch with 422 `extra_forbidden`, so the `glm_thinking` quirk must not
+/// shape requests for it: Mistral-hosted GLM emits reasoning by default, as
+/// structured `thinking` blocks inside `delta.content`.
+pub fn is_mistral_host(host: Option<&str>) -> bool {
+    host.is_some_and(|host| {
+        let host = host.to_ascii_lowercase();
+        host == "mistral.ai" || host.ends_with(".mistral.ai")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +103,18 @@ mod tests {
         assert!(is_glm_like_model("ZhipuAI/foo"));
         assert!(is_glm_like_model("bigmodel-x"));
         assert!(!is_glm_like_model("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn mistral_host_matching() {
+        assert!(is_mistral_host(Some("api.mistral.ai")));
+        assert!(is_mistral_host(Some("codestral.mistral.ai")));
+        assert!(is_mistral_host(Some("API.MISTRAL.AI")));
+        // Only Mistral's own domain is matched; lookalike hosts on other
+        // domains (self-hosted proxies, etc.) keep the default request shape.
+        assert!(!is_mistral_host(Some("127.0.0.1")));
+        assert!(!is_mistral_host(Some("mistral-proxy.example.com")));
+        assert!(!is_mistral_host(Some("mistral.ai.evil.example")));
+        assert!(!is_mistral_host(None));
     }
 }

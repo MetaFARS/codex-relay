@@ -1088,7 +1088,12 @@ async fn handle_responses_inner(
     let model = req.model.clone();
     let namespace_tools = translate::namespace_tool_map(&req.tools);
     let custom_tools = translate::custom_tool_map(&req.tools);
-    let mut chat_req = translate::to_chat_request(&req, history, &state.sessions);
+    let mut chat_req = translate::to_chat_request_with_upstream(
+        &req,
+        history,
+        &state.sessions,
+        state.upstream.host_str(),
+    );
     trace.mark_translated();
     debug!(
         "→ upstream tools={}",

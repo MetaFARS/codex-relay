@@ -43,10 +43,26 @@ pub fn validate_unique_chat_tool_names(tools: &[Value]) -> Result<(), String> {
 }
 
 /// Convert a Responses API request + prior history into a Chat Completions request.
+// The binary calls [`to_chat_request_with_upstream`] directly; this wrapper
+// stays for integration tests and other callers without upstream context, so
+// it appears unused in the bin target.
+#[allow(dead_code)]
 pub fn to_chat_request(
     req: &ResponsesRequest,
     history: Vec<ChatMessage>,
     sessions: &SessionStore,
+) -> ChatRequest {
+    to_chat_request_with_upstream(req, history, sessions, None)
+}
+
+/// Like [`to_chat_request`], but provider-aware: the upstream host lets
+/// request-shaping quirks adapt to what the target API actually accepts
+/// (e.g. Mistral rejects the GLM `thinking` switch).
+pub fn to_chat_request_with_upstream(
+    req: &ResponsesRequest,
+    history: Vec<ChatMessage>,
+    sessions: &SessionStore,
+    upstream_host: Option<&str>,
 ) -> ChatRequest {
     let mut messages = history;
 
@@ -296,8 +312,13 @@ pub fn to_chat_request(
     // enabled; its default auto-thinking is suppressed by heavy agent system
     // prompts (e.g. Codex). Other providers (DeepSeek/Kimi) think by default and
     // must not receive this field, so it stays GLM-gated to preserve their
-    // request shape. See GitHub issue #26 and the quirk registry in quirks.rs.
+    // request shape. Mistral additionally rejects the top-level `thinking`
+    // field outright (422 extra_forbidden); its hosted GLM emits reasoning by
+    // default as structured `thinking` content blocks, so the quirk never
+    // shapes Mistral requests — reasoning still flows, via the SSE parser.
+    // See GitHub issue #26 and the quirk registry in quirks.rs.
     let enable_glm_thinking = crate::quirks::quirk_enabled("glm_thinking")
+        && !crate::quirks::is_mistral_host(upstream_host)
         && (crate::quirks::is_glm_like_model(&req.model)
             || crate::quirks::is_glm_like_model(&mapped_model));
 
@@ -1210,6 +1231,44 @@ mod tests {
             instructions: None,
             reasoning: None,
         }
+    }
+
+    #[test]
+    fn glm_thinking_switch_is_provider_aware() {
+        // Mistral rejects the top-level `thinking` field (422 extra_forbidden),
+        // so the glm_thinking quirk must not shape requests for it. Mistral-
+        // hosted GLM still reasons: it streams structured `thinking` content
+        // blocks by default, which the SSE parser routes to reasoning events.
+        let mut req = base_req(ResponsesInput::Text("hi".into()));
+        req.model = "zai-glm-5-3-flash".into();
+        let sessions = SessionStore::new();
+
+        let mistral =
+            to_chat_request_with_upstream(&req, vec![], &sessions, Some("api.mistral.ai"));
+        assert!(
+            mistral.thinking.is_none(),
+            "Mistral request must not carry the thinking switch"
+        );
+
+        // The same GLM model against any other upstream keeps the quirk's
+        // established behavior (issue #26).
+        let other =
+            to_chat_request_with_upstream(&req, vec![], &sessions, Some("open.bigmodel.cn"));
+        assert_eq!(
+            other.thinking.map(|t| t.kind).as_deref(),
+            Some("enabled"),
+            "non-Mistral GLM request must keep the thinking switch"
+        );
+    }
+
+    #[test]
+    fn glm_thinking_switch_applies_without_upstream_host() {
+        // Callers without upstream context (legacy to_chat_request) keep the
+        // original behavior: GLM-like model names always get the switch.
+        let mut req = base_req(ResponsesInput::Text("hi".into()));
+        req.model = "glm-5.2".into();
+        let chat = to_chat_request(&req, vec![], &SessionStore::new());
+        assert_eq!(chat.thinking.map(|t| t.kind).as_deref(), Some("enabled"));
     }
 
     #[test]

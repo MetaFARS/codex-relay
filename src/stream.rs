@@ -42,6 +42,8 @@ pub struct StreamArgs {
     pub model: String,
     pub corpus: Option<CorpusRecorder>,
     pub previous_response_id: Option<String>,
+    /// Opt-in lifecycle trace (CODEX_RELAY_TRACE_TIMINGS); inert when disabled.
+    pub trace: crate::timing::RequestTrace,
 }
 
 struct ToolCallAccum {
@@ -88,6 +90,7 @@ pub fn translate_stream(
         model,
         corpus,
         previous_response_id,
+        mut trace,
     } = args;
     let msg_item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     let reasoning_item_id = format!("rs_{}", uuid::Uuid::new_v4().simple());
@@ -109,6 +112,7 @@ pub fn translate_stream(
             Ok(body) => body,
             Err(e) => {
                 error!("upstream request body error: {e}");
+                trace.finish(&response_id, false);
                 yield Ok(Event::default().event("response.failed").data(
                     json!({"type": "response.failed", "response": {"id": &response_id, "status": "failed", "error": {"code": "request_body_error", "message": e.to_string()}}}).to_string()
                 ));
@@ -117,12 +121,18 @@ pub fn translate_stream(
         };
         let allowed_tool_names = allowed_upstream_tool_names(&chat_req.tools, &upstream_body);
 
-        let upstream = match builder.json(&upstream_body).send().await {
-            Ok(r) if r.status().is_success() => r,
+        let builder = builder.json(&upstream_body);
+        trace.mark(crate::timing::Phase::UpstreamSent);
+        let upstream = match builder.send().await {
+            Ok(r) if r.status().is_success() => {
+                trace.mark(crate::timing::Phase::UpstreamHeaders);
+                r
+            }
             Ok(r) => {
                 let status = r.status();
                 let body = r.text().await.unwrap_or_default();
                 error!("upstream {status}: {body}");
+                trace.finish(&response_id, false);
                 yield Ok(Event::default().event("response.failed").data(
                     json!({"type": "response.failed", "response": {"id": &response_id, "status": "failed", "error": {"code": status.as_u16().to_string(), "message": body}}}).to_string()
                 ));
@@ -130,6 +140,7 @@ pub fn translate_stream(
             }
             Err(e) => {
                 error!("upstream request failed: {e}");
+                trace.finish(&response_id, false);
                 yield Ok(Event::default().event("response.failed").data(
                     json!({"type": "response.failed", "response": {"id": &response_id, "status": "failed", "error": {"code": "connection_error", "message": e.to_string()}}}).to_string()
                 ));
@@ -218,6 +229,7 @@ pub fn translate_stream(
                         }
                         Ok(chunk) => {
                             let ChatStreamChunk { choices, usage } = chunk;
+                            trace.mark(crate::timing::Phase::FirstUpstreamEvent);
                             if usage.is_some() {
                                 stream_usage = usage;
                             }
@@ -259,6 +271,7 @@ pub fn translate_stream(
                                     let rc = reasoning_delta.as_str();
                                     if !rc.is_empty() {
                                         reasoning_chunks += 1;
+                                        trace.mark(crate::timing::Phase::FirstReasoning);
                                         let output_index = match reasoning_output_index {
                                             Some(idx) => idx,
                                             None => {
@@ -295,6 +308,7 @@ pub fn translate_stream(
                                 // Visible text after DSML and think healing.
                                 let content = think.text;
                                 if !content.is_empty() {
+                                    trace.mark(crate::timing::Phase::FirstText);
                                     let output_index = match message_output_index {
                                         Some(idx) => idx,
                                         None => {
@@ -360,6 +374,8 @@ pub fn translate_stream(
             }
         }
 
+        trace.mark(crate::timing::Phase::UpstreamCompleted);
+
         // Decide the terminal state before flushing filters or marking any
         // output item completed. Partial deltas may already have reached the
         // client, but a truncated or malformed stream must never authorize a
@@ -383,6 +399,7 @@ pub fn translate_stream(
                 "stream disconnected before completion".to_string(),
             ));
             warn!("upstream stream failed before completion: {message}");
+            trace.finish(&response_id, false);
             yield Ok(Event::default()
                 .event("response.failed")
                 .data(json!({
@@ -494,6 +511,7 @@ pub fn translate_stream(
             &allowed_tool_names,
         ) {
             warn!("rejecting invalid upstream tool calls: {message}");
+            trace.finish(&response_id, false);
             yield Ok(Event::default()
                 .event("response.failed")
                 .data(json!({
@@ -731,6 +749,8 @@ pub fn translate_stream(
                 .collect();
             let usage = stream_usage.unwrap_or_default();
             debug!("cache(stream): {}", usage.cache_summary());
+            trace.record_usage(usage.prompt_tokens, usage.completion_tokens);
+            trace.finish(&response_id, true);
 
             yield Ok(Event::default()
                 .event("response.completed")
@@ -756,6 +776,7 @@ pub fn translate_stream(
             // to avoid creating an assistant-with-tool_calls gap in history
             // that causes upstream "insufficient tool messages" errors.
             warn!("stream disconnected before [DONE] — discarding partial turn");
+            trace.finish(&response_id, false);
             yield Ok(Event::default()
                 .event("response.failed")
                 .data(json!({

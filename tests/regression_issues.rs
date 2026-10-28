@@ -2837,3 +2837,72 @@ async fn mistral_two_turn_history_replays_reasoning_and_tool_calls() {
     assert_eq!(tool_msg["tool_call_id"], "call_t1");
     assert_eq!(tool_msg["content"], "a.txt\nb.txt");
 }
+
+/// Mistral-hosted GLM returns `content` as structured blocks in blocking
+/// (`stream: false`) responses too. `ChatMessage::text_content()` returns ""
+/// for a non-string `content`, so before normalization the relay emitted an
+/// empty assistant message and dropped the reasoning that lived in the
+/// `thinking` block.
+#[test]
+fn blocking_structured_content_blocks_are_flattened() {
+    let chat = ChatResponse {
+        choices: vec![ChatChoice {
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: Some(json!([
+                    {"type": "thinking", "thinking": [{"type": "text", "text": "weighing options"}], "closed": true},
+                    {"type": "text", "text": "Here is the answer."}
+                ])),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+        }],
+        usage: None,
+    };
+
+    let (response, _) = from_chat_response_with_tool_map(
+        "resp_blocks".into(),
+        "mock-model",
+        chat,
+        &Default::default(),
+    );
+
+    let message = response
+        .output
+        .iter()
+        .find(|item| item["type"] == "message")
+        .expect("blocking reply must still produce a message item");
+    assert_eq!(message["content"][0]["text"], "Here is the answer.");
+
+    let reasoning = response
+        .output
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .expect("thinking block must be surfaced as reasoning");
+    assert_eq!(reasoning["summary"][0]["text"], "weighing options");
+}
+
+/// The normalizer must not touch multimodal *input* part arrays, which are
+/// structural rather than block-shaped text.
+#[test]
+fn response_normalizer_ignores_multimodal_parts() {
+    let mut message = ChatMessage {
+        role: "user".into(),
+        content: Some(json!([
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        ])),
+        reasoning_content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    };
+    let before = message.content.clone();
+    message.normalize_response_content();
+    assert_eq!(
+        message.content, before,
+        "input part arrays must pass through untouched"
+    );
+}

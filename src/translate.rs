@@ -898,6 +898,12 @@ pub fn from_chat_response_with_tool_maps(
         crate::dsml::heal_chat_message(&mut choice.message);
     }
 
+    // Mistral-hosted GLM returns `content` as structured blocks
+    // (`[{type:"text"},{type:"thinking"}]`) in blocking responses too, not only
+    // in SSE deltas. Flatten it before anything reads `text_content()`, which
+    // yields "" for non-string content and would silently drop the reply.
+    choice.message.normalize_response_content();
+
     // Reasoning models served without a vLLM reasoning parser leak `<think>`
     // markup into the text content instead of `reasoning_content`; split it out
     // so Codex never renders it and history never replays it.

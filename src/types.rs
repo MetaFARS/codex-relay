@@ -159,6 +159,44 @@ impl ChatMessage {
     pub fn text_content(&self) -> &str {
         self.content.as_ref().and_then(|v| v.as_str()).unwrap_or("")
     }
+
+    /// Flatten an *assistant response* whose `content` is a structured block
+    /// array (Mistral-hosted GLM) into the plain-string shape every other
+    /// provider uses: `text` blocks become the content, `thinking` blocks move
+    /// to `reasoning_content`.
+    ///
+    /// Call this only on responses. Inbound messages legitimately carry
+    /// multimodal part arrays (`image_url`), which must keep their structure —
+    /// so an array containing any block that is not a `text`/`thinking` block
+    /// is left untouched rather than flattened and losing its parts.
+    /// Normalizing once at the response boundary keeps `text_content()`,
+    /// retained history, and the corpus on one representation, so a blocking
+    /// (`stream: false`) reply is not silently emptied.
+    pub fn normalize_response_content(&mut self) {
+        let Some(Value::Array(_)) = self.content.as_ref() else {
+            return;
+        };
+        let Ok(blocks) =
+            serde_json::from_value::<Vec<DeltaBlock>>(self.content.clone().unwrap_or_default())
+        else {
+            return;
+        };
+
+        let block_shaped = blocks
+            .iter()
+            .all(|block| matches!(block.kind.as_deref(), Some("text") | Some("thinking")));
+        if !block_shaped {
+            return;
+        }
+
+        self.content = Some(Value::String(blocks_text(&blocks).unwrap_or_default()));
+
+        if self.reasoning_content.as_deref().is_none_or(str::is_empty) {
+            if let Some(thinking) = blocks_thinking(&blocks) {
+                self.reasoning_content = Some(thinking);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -328,17 +366,7 @@ impl ChatDelta {
     pub fn content_text(&self) -> Option<Cow<'_, str>> {
         match self.content.as_ref()? {
             DeltaContent::Text(text) => Some(Cow::Borrowed(text)),
-            DeltaContent::Blocks(blocks) => {
-                let mut joined = String::new();
-                for block in blocks {
-                    if block.kind.as_deref() == Some("text") {
-                        if let Some(text) = &block.text {
-                            joined.push_str(text);
-                        }
-                    }
-                }
-                (!joined.is_empty()).then_some(Cow::Owned(joined))
-            }
+            DeltaContent::Blocks(blocks) => blocks_text(blocks).map(Cow::Owned),
         }
     }
 
@@ -346,29 +374,49 @@ impl ChatDelta {
     /// (Mistral-hosted GLM). `None` for plain-string content and for deltas
     /// without thinking payloads.
     pub fn thinking_text(&self) -> Option<String> {
-        let blocks = match self.content.as_ref()? {
-            DeltaContent::Blocks(blocks) => blocks,
-            DeltaContent::Text(_) => return None,
-        };
-        let mut joined = String::new();
-        for block in blocks {
-            if block.kind.as_deref() != Some("thinking") {
-                continue;
-            }
-            match &block.thinking {
-                Some(ThinkingPayload::Text(text)) => joined.push_str(text),
-                Some(ThinkingPayload::Items(items)) => {
-                    for item in items {
-                        if let Some(text) = &item.text {
-                            joined.push_str(text);
-                        }
-                    }
-                }
-                None => {}
+        match self.content.as_ref()? {
+            DeltaContent::Blocks(blocks) => blocks_thinking(blocks),
+            DeltaContent::Text(_) => None,
+        }
+    }
+}
+
+/// Concatenate the visible `text` blocks of a structured content array.
+/// Returns `None` when the array carries no visible text.
+fn blocks_text(blocks: &[DeltaBlock]) -> Option<String> {
+    let mut joined = String::new();
+    for block in blocks {
+        if block.kind.as_deref() == Some("text") {
+            if let Some(text) = &block.text {
+                joined.push_str(text);
             }
         }
-        (!joined.is_empty()).then_some(joined)
     }
+    (!joined.is_empty()).then_some(joined)
+}
+
+/// Concatenate the reasoning carried by `thinking` blocks of a structured
+/// content array. Both observed payload shapes (a plain string, or a list of
+/// `text` items) are accepted.
+fn blocks_thinking(blocks: &[DeltaBlock]) -> Option<String> {
+    let mut joined = String::new();
+    for block in blocks {
+        if block.kind.as_deref() != Some("thinking") {
+            continue;
+        }
+        match &block.thinking {
+            Some(ThinkingPayload::Text(text)) => joined.push_str(text),
+            Some(ThinkingPayload::Items(items)) => {
+                for item in items {
+                    if let Some(text) = &item.text {
+                        joined.push_str(text);
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    (!joined.is_empty()).then_some(joined)
 }
 
 #[derive(Debug, Deserialize, Default)]

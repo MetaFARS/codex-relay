@@ -477,8 +477,25 @@ fn format_codex_config_snippet(
     writeln!(out)?;
     writeln!(out, "[model_providers.{}]", toml_string(provider_name)?)?;
     writeln!(out, "name = {}", toml_string(provider_name)?)?;
+    writeln!(
+        out,
+        "# The relay must already be running and listening here: Codex talks to it,"
+    )?;
+    writeln!(
+        out,
+        "# and it translates for the upstream API. If Codex runs on another machine,"
+    )?;
+    writeln!(
+        out,
+        "# replace the loopback address with this host's address."
+    )?;
     writeln!(out, "base_url = {}", toml_string(relay_base_url)?)?;
     writeln!(out, "wire_api = \"responses\"")?;
+    writeln!(
+        out,
+        "# Codex only requires this variable to exist; the relay authenticates to"
+    )?;
+    writeln!(out, "# the upstream with its own CODEX_RELAY_API_KEY.")?;
     let env_key = format!(
         "{}_API_KEY",
         provider_name.to_uppercase().replace(['-', '.'], "_")
@@ -2152,6 +2169,17 @@ mod tests {
             snippet.contains("#   --model-catalog ~/.codex/codex-relay-models.json"),
             "{snippet}"
         );
+        // The snippet now dials the relay, so it must say the relay has to be
+        // up first, and that the env var is only a Codex-side precondition.
+        assert!(
+            snippet.contains("The relay must already be running"),
+            "{snippet}"
+        );
+        assert!(snippet.contains("CODEX_RELAY_API_KEY"), "{snippet}");
+        assert!(
+            snippet.contains("replace the loopback address"),
+            "{snippet}"
+        );
     }
 
     #[test]
@@ -2173,8 +2201,8 @@ mod tests {
             "{snippet}"
         );
         assert!(
-            !snippet.contains("model-catalog ~/.codex/codex-relay-models.json\n#   "),
-            "{snippet}"
+            !snippet.contains("--model-catalog"),
+            "the rerun hint must disappear once the catalog is written: {snippet}"
         );
     }
 

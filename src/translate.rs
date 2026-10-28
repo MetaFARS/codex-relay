@@ -91,6 +91,18 @@ pub fn to_chat_request_with_upstream(
 
     let request_has_system = system_text.is_some();
 
+    // Providers that gate on it (DeepSeek) require `reasoning_content` to be
+    // *present* on replayed assistant turns whenever the request is in thinking
+    // mode. Omitting the field — which is what happens when the model emitted no
+    // reasoning for that turn — fails upstream with
+    // `400 the reasoning_content in the thinking mode must be passed back`.
+    // An empty string satisfies the check.
+    let thinking_mode = req
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| reasoning.effort.as_deref())
+        .is_some_and(|effort| !effort.eq_ignore_ascii_case("none"));
+
     // Append new input, mapping Responses API roles to Chat Completions roles.
     match &req.input {
         ResponsesInput::Text(text) => {
@@ -216,6 +228,11 @@ pub fn to_chat_request_with_upstream(
                         msg.reasoning_content =
                             request_turn_reasoning(sessions, &messages, &msg, system_text);
                     }
+                    // Thinking-mode providers reject a replayed tool-call turn that
+                    // omits reasoning_content entirely; an empty string is accepted.
+                    if msg.reasoning_content.is_none() && thinking_mode {
+                        msg.reasoning_content = Some(String::new());
+                    }
                     messages.push(msg);
                 } else {
                     match item_type {
@@ -257,6 +274,12 @@ pub fn to_chat_request_with_upstream(
                             if msg.role == "assistant" {
                                 msg.reasoning_content =
                                     request_turn_reasoning(sessions, &messages, &msg, system_text);
+                                // Same requirement as tool-call turns: thinking-mode
+                                // providers want the field present even when that turn
+                                // produced no reasoning text.
+                                if msg.reasoning_content.is_none() && thinking_mode {
+                                    msg.reasoning_content = Some(String::new());
+                                }
                             }
                             // System/developer messages from input items must go to the
                             // front of the array. Codex sometimes interleaves them between

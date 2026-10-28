@@ -2906,3 +2906,79 @@ fn response_normalizer_ignores_multimodal_parts() {
         "input part arrays must pass through untouched"
     );
 }
+
+/// DeepSeek rejects a replayed tool-call turn that omits `reasoning_content`
+/// entirely while the request is in thinking mode:
+/// `400 the reasoning_content in the thinking mode must be passed back to the API`.
+/// The model frequently emits no reasoning for a turn that calls a tool, so the
+/// relay must still send the field (empty string) rather than dropping it.
+#[test]
+fn thinking_mode_replay_always_sends_reasoning_content() {
+    let body = json!({
+        "model": "deepseek-flash",
+        "stream": true,
+        "reasoning": {"effort": "high"},
+        "input": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "run it"}]},
+            {"type": "function_call", "call_id": "call_1",
+             "name": "exec_command", "arguments": "{\"cmd\":\"echo hi\"}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "hi"}
+        ],
+        "tools": [{"type": "function", "name": "exec_command",
+                   "parameters": {"type": "object",
+                                  "properties": {"cmd": {"type": "string"}}}}]
+    });
+    let req: ResponsesRequest = serde_json::from_value(body).unwrap();
+    let sessions = SessionStore::default();
+
+    let chat = to_chat_request(&req, Vec::new(), &sessions);
+    let assistant = chat
+        .messages
+        .iter()
+        .find(|m| m.role == "assistant" && m.tool_calls.is_some())
+        .expect("replayed tool-call turn produces an assistant message");
+
+    assert_eq!(
+        assistant.reasoning_content.as_deref(),
+        Some(""),
+        "thinking mode must send reasoning_content even when no reasoning was captured"
+    );
+
+    let serialized = serde_json::to_value(assistant).unwrap();
+    assert_eq!(serialized.get("reasoning_content"), Some(&json!("")));
+}
+
+/// The same replay outside thinking mode must not invent the field, so providers
+/// that do not use `reasoning_content` never see it.
+#[test]
+fn non_thinking_mode_replay_omits_reasoning_content() {
+    let body = json!({
+        "model": "deepseek-flash",
+        "stream": true,
+        "input": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "run it"}]},
+            {"type": "function_call", "call_id": "call_1",
+             "name": "exec_command", "arguments": "{\"cmd\":\"echo hi\"}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "hi"}
+        ],
+        "tools": [{"type": "function", "name": "exec_command",
+                   "parameters": {"type": "object",
+                                  "properties": {"cmd": {"type": "string"}}}}]
+    });
+    let req: ResponsesRequest = serde_json::from_value(body).unwrap();
+    let sessions = SessionStore::default();
+
+    let chat = to_chat_request(&req, Vec::new(), &sessions);
+    let assistant = chat
+        .messages
+        .iter()
+        .find(|m| m.role == "assistant" && m.tool_calls.is_some())
+        .expect("replayed tool-call turn produces an assistant message");
+
+    assert!(
+        assistant.reasoning_content.is_none(),
+        "reasoning_content must stay absent when the request is not in thinking mode"
+    );
+}

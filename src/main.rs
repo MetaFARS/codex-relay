@@ -670,11 +670,28 @@ struct UpstreamModelInfo {
 /// Extract the usable context-window size from one upstream model entry.
 /// Absent, non-integer, and zero values are treated as unknown so the
 /// heuristic estimate stays in charge instead of fabricating a window.
+///
+/// Field names differ by provider and none of them is standardised, so every
+/// known spelling is probed in descending confidence order:
+///
+/// | field                | provider                                  |
+/// |----------------------|-------------------------------------------|
+/// | `context_window`     | DeepSeek (`/v1/models`), some gateways    |
+/// | `max_context_length` | Mistral                                   |
+/// | `context_length`     | OpenRouter                                |
+/// | `max_model_len`      | vLLM and vLLM-based servers               |
+/// | `n_ctx`              | llama.cpp / llama-server                  |
 fn upstream_context_length(model: &serde_json::Value) -> Option<u64> {
-    ["max_context_length", "context_length"]
-        .iter()
-        .find_map(|key| model.get(*key).and_then(serde_json::Value::as_u64))
-        .filter(|length| *length > 0)
+    [
+        "context_window",
+        "max_context_length",
+        "context_length",
+        "max_model_len",
+        "n_ctx",
+    ]
+    .iter()
+    .find_map(|key| model.get(*key).and_then(serde_json::Value::as_u64))
+    .filter(|length| *length > 0)
 }
 
 /// Parse a `/v1/models` response body (legacy `{data:[...]}` and Codex-style
@@ -699,8 +716,10 @@ fn upstream_models_from_response(body: &serde_json::Value) -> Vec<UpstreamModelI
 }
 
 /// Heuristic-based model property estimation.
-/// Providers don't expose context window sizes in their /v1/models endpoint,
-/// so we use conservative defaults based on model family name.
+///
+/// Used only for providers that report nothing usable in `/v1/models`: many
+/// OpenAI-compatible endpoints expose no context metadata at all, so a
+/// conservative default per model family is better than none.
 ///
 /// When the upstream *does* report a context length, it wins: the provider's
 /// own metadata is authoritative and the heuristic exists only for providers
@@ -2174,6 +2193,30 @@ mod tests {
 
     #[test]
     fn upstream_context_length_field_shapes() {
+        // DeepSeek shape (api.deepseek.com/v1/models): `context_window`, with
+        // no `context_length` or `max_context_length` at all. Missing this
+        // spelling left DeepSeek on the heuristic 262144 while the model really
+        // serves 1048576.
+        assert_eq!(
+            upstream_context_length(&json!({
+                "id": "deepseek-flash",
+                "object": "model",
+                "owned_by": "deepseek",
+                "context_window": 1_048_576,
+                "max_output_tokens": 393_216
+            })),
+            Some(1_048_576)
+        );
+        // vLLM shape.
+        assert_eq!(
+            upstream_context_length(&json!({"max_model_len": 32_768})),
+            Some(32_768)
+        );
+        // llama.cpp shape.
+        assert_eq!(
+            upstream_context_length(&json!({"n_ctx": 8_192})),
+            Some(8_192)
+        );
         // Mistral shape.
         assert_eq!(
             upstream_context_length(&json!({"max_context_length": 1_048_576})),

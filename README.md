@@ -431,11 +431,20 @@ This project is **not affiliated with, endorsed by, or sponsored by OpenAI**. "C
 ## Contributors
 
 - [myk5010](https://github.com/myk5010) — system/developer message ordering fix and model name mapping ([\#4](https://github.com/MetaFARS/codex-relay/pull/4))
-- [qcnhy](https://github.com/qcnhy) — streaming usage, MCP namespace bug reports, namespace tool-routing analysis, and independent verification ([\#5](https://github.com/MetaFARS/codex-relay/issues/5), [\#6](https://github.com/MetaFARS/codex-relay/issues/6), [\#17](https://github.com/MetaFARS/codex-relay/issues/17))
-- [JasonC93](https://github.com/JasonC93) — subagent tool-routing and spawned-agent context isolation reports ([\#10](https://github.com/MetaFARS/codex-relay/issues/10), [\#12](https://github.com/MetaFARS/codex-relay/issues/12))
+- [qcnhy](https://github.com/qcnhy) — streaming usage, MCP namespace bug reports, namespace tool-routing analysis, reasoning and apply_patch feature reports, nested-namespace and encrypted-content regression reports, and independent verification ([\#5](https://github.com/MetaFARS/codex-relay/issues/5), [\#6](https://github.com/MetaFARS/codex-relay/issues/6), [\#17](https://github.com/MetaFARS/codex-relay/issues/17), [\#26](https://github.com/MetaFARS/codex-relay/issues/26), [\#37](https://github.com/MetaFARS/codex-relay/issues/37), [\#39](https://github.com/MetaFARS/codex-relay/issues/39), [\#40](https://github.com/MetaFARS/codex-relay/issues/40), [\#60](https://github.com/MetaFARS/codex-relay/issues/60), [\#61](https://github.com/MetaFARS/codex-relay/issues/61))
+- [JasonC93](https://github.com/JasonC93) — subagent tool-routing and spawned-agent context isolation reports ([\#10](https://github.com/MetaFARS/codex-relay/issues/10), [\#12](https://github.com/MetaFARS/codex-relay/issues/12), [\#24](https://github.com/MetaFARS/codex-relay/issues/24))
 - [ma-buting](https://github.com/ma-buting) — namespace tool-name separator fix ([\#19](https://github.com/MetaFARS/codex-relay/pull/19))
 - [SaladDay](https://github.com/SaladDay) — prompt-cache accounting debug logs ([\#22](https://github.com/MetaFARS/codex-relay/pull/22))
 - [Cherno76](https://github.com/Cherno76) — prompt-cache hit tokens in Responses API usage ([\#23](https://github.com/MetaFARS/codex-relay/pull/23))
+- [the1here2me](https://github.com/the1here2me) — upstream parameter override request behind `--upstream-extra-params` and `--drop-upstream-params` ([\#29](https://github.com/MetaFARS/codex-relay/issues/29))
+- [andrewzah](https://github.com/andrewzah) — dropped `[DONE]` recovery, leaked `<think>` markup routing, parallel-test port races, and the outdated config-syntax report ([\#31](https://github.com/MetaFARS/codex-relay/issues/31), [\#32](https://github.com/MetaFARS/codex-relay/issues/32), [\#58](https://github.com/MetaFARS/codex-relay/issues/58), [\#46](https://github.com/MetaFARS/codex-relay/pull/46))
+- [0xAndoroid](https://github.com/0xAndoroid) — plaintext collaboration argument negotiation for subagents ([\#43](https://github.com/MetaFARS/codex-relay/pull/43))
+- [0x5446](https://github.com/0x5446) — empty-message filtering, `reasoning.effort` forwarding, and doubled-delimiter DSML healing ([\#47](https://github.com/MetaFARS/codex-relay/pull/47), [\#48](https://github.com/MetaFARS/codex-relay/pull/48), [\#49](https://github.com/MetaFARS/codex-relay/pull/49))
+- [dennisimoo](https://github.com/dennisimoo) — zero-argument tool-call wedge report ([\#57](https://github.com/MetaFARS/codex-relay/issues/57))
+- [dhruv-anand-aintech](https://github.com/dhruv-anand-aintech) — opt-in OpenCode Go compatibility mode ([\#64](https://github.com/MetaFARS/codex-relay/pull/64))
+- [365daysdreamer](https://github.com/365daysdreamer) — Codex instruction preservation and `apply_patch` tool-description normalization ([\#65](https://github.com/MetaFARS/codex-relay/pull/65))
+- [andrei-21](https://github.com/andrei-21) — graceful shutdown with request draining ([\#66](https://github.com/MetaFARS/codex-relay/pull/66))
+- [VikingOwl91](https://github.com/VikingOwl91) — Mistral structured SSE and GLM thinking compatibility, relay URL in the generated config, upstream context limits in the model catalog, and opt-in request lifecycle timing ([\#67](https://github.com/MetaFARS/codex-relay/pull/67), [\#68](https://github.com/MetaFARS/codex-relay/pull/68), [\#69](https://github.com/MetaFARS/codex-relay/pull/69), [\#70](https://github.com/MetaFARS/codex-relay/pull/70))
 
 ## License
 

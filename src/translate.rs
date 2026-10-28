@@ -43,10 +43,26 @@ pub fn validate_unique_chat_tool_names(tools: &[Value]) -> Result<(), String> {
 }
 
 /// Convert a Responses API request + prior history into a Chat Completions request.
+// The binary calls [`to_chat_request_with_upstream`] directly; this wrapper
+// stays for integration tests and other callers without upstream context, so
+// it appears unused in the bin target.
+#[allow(dead_code)]
 pub fn to_chat_request(
     req: &ResponsesRequest,
     history: Vec<ChatMessage>,
     sessions: &SessionStore,
+) -> ChatRequest {
+    to_chat_request_with_upstream(req, history, sessions, None)
+}
+
+/// Like [`to_chat_request`], but provider-aware: the upstream host lets
+/// request-shaping quirks adapt to what the target API actually accepts
+/// (e.g. Mistral rejects the GLM `thinking` switch).
+pub fn to_chat_request_with_upstream(
+    req: &ResponsesRequest,
+    history: Vec<ChatMessage>,
+    sessions: &SessionStore,
+    upstream_host: Option<&str>,
 ) -> ChatRequest {
     let mut messages = history;
 
@@ -291,13 +307,40 @@ pub fn to_chat_request(
         }));
     }
 
+    // Quirk mistral_reasoning_content: Mistral's Chat Completions schema
+    // rejects `reasoning_content` on assistant messages with 422
+    // `extra_forbidden` (verified live), and offers no accepted equivalent
+    // field, so historical reasoning can be neither retained nor transformed
+    // on the wire. Omit it from the outgoing request only: the session store
+    // (retained_messages above) keeps the reasoning untouched, other
+    // providers keep the replayed reasoning_content they expect, and
+    // Mistral-hosted models re-derive their thinking fresh each turn, so
+    // continuity does not depend on the replay.
+    if crate::quirks::quirk_enabled("mistral_reasoning_content")
+        && crate::quirks::is_mistral_host(upstream_host)
+    {
+        let stripped = messages
+            .iter_mut()
+            .filter(|message| message.role == "assistant")
+            .filter_map(|message| message.reasoning_content.take())
+            .count();
+        if stripped > 0 {
+            tracing::debug!("quirk mistral_reasoning_content fired: stripped reasoning_content from {stripped} assistant history message(s)");
+        }
+    }
+
     let mapped_model = map_model_name(&req.model);
     // GLM/Zhipu only emits reasoning_content when `thinking` is explicitly
     // enabled; its default auto-thinking is suppressed by heavy agent system
     // prompts (e.g. Codex). Other providers (DeepSeek/Kimi) think by default and
     // must not receive this field, so it stays GLM-gated to preserve their
-    // request shape. See GitHub issue #26 and the quirk registry in quirks.rs.
+    // request shape. Mistral additionally rejects the top-level `thinking`
+    // field outright (422 extra_forbidden); its hosted GLM emits reasoning by
+    // default as structured `thinking` content blocks, so the quirk never
+    // shapes Mistral requests — reasoning still flows, via the SSE parser.
+    // See GitHub issue #26 and the quirk registry in quirks.rs.
     let enable_glm_thinking = crate::quirks::quirk_enabled("glm_thinking")
+        && !crate::quirks::is_mistral_host(upstream_host)
         && (crate::quirks::is_glm_like_model(&req.model)
             || crate::quirks::is_glm_like_model(&mapped_model));
 
@@ -855,6 +898,12 @@ pub fn from_chat_response_with_tool_maps(
         crate::dsml::heal_chat_message(&mut choice.message);
     }
 
+    // Mistral-hosted GLM returns `content` as structured blocks
+    // (`[{type:"text"},{type:"thinking"}]`) in blocking responses too, not only
+    // in SSE deltas. Flatten it before anything reads `text_content()`, which
+    // yields "" for non-string content and would silently drop the reply.
+    choice.message.normalize_response_content();
+
     // Reasoning models served without a vLLM reasoning parser leak `<think>`
     // markup into the text content instead of `reasoning_content`; split it out
     // so Codex never renders it and history never replays it.
@@ -1210,6 +1259,158 @@ mod tests {
             instructions: None,
             reasoning: None,
         }
+    }
+
+    #[test]
+    fn glm_thinking_switch_is_provider_aware() {
+        // Mistral rejects the top-level `thinking` field (422 extra_forbidden),
+        // so the glm_thinking quirk must not shape requests for it. Mistral-
+        // hosted GLM still reasons: it streams structured `thinking` content
+        // blocks by default, which the SSE parser routes to reasoning events.
+        let mut req = base_req(ResponsesInput::Text("hi".into()));
+        req.model = "zai-glm-5-3-flash".into();
+        let sessions = SessionStore::new();
+
+        let mistral =
+            to_chat_request_with_upstream(&req, vec![], &sessions, Some("api.mistral.ai"));
+        assert!(
+            mistral.thinking.is_none(),
+            "Mistral request must not carry the thinking switch"
+        );
+
+        // The same GLM model against any other upstream keeps the quirk's
+        // established behavior (issue #26).
+        let other =
+            to_chat_request_with_upstream(&req, vec![], &sessions, Some("open.bigmodel.cn"));
+        assert_eq!(
+            other.thinking.map(|t| t.kind).as_deref(),
+            Some("enabled"),
+            "non-Mistral GLM request must keep the thinking switch"
+        );
+    }
+
+    #[test]
+    fn glm_thinking_switch_applies_without_upstream_host() {
+        // Callers without upstream context (legacy to_chat_request) keep the
+        // original behavior: GLM-like model names always get the switch.
+        let mut req = base_req(ResponsesInput::Text("hi".into()));
+        req.model = "glm-5.2".into();
+        let chat = to_chat_request(&req, vec![], &SessionStore::new());
+        assert_eq!(chat.thinking.map(|t| t.kind).as_deref(), Some("enabled"));
+    }
+
+    fn reasoning_replay_request() -> ResponsesRequest {
+        // Turn 2 replay: Codex re-sends the previous assistant function_call
+        // plus its output. The session store holds the reasoning recorded
+        // during turn 1 (Mistral GLM streams it as structured thinking
+        // blocks), which the translation injects into the assistant message.
+        let mut req = base_req(ResponsesInput::Messages(vec![
+            json!({
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"ls\"}"
+            }),
+            json!({
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "file list"
+            }),
+        ]));
+        req.model = "zai-glm-5-3-flash".into();
+        req
+    }
+
+    #[test]
+    fn mistral_upstream_strips_history_reasoning_content() {
+        // quirk_enabled() reads process env; hold the lock so the kill-switch
+        // test cannot mutate CODEX_RELAY_DISABLE_QUIRKS mid-run.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let sessions = SessionStore::new();
+        sessions.store_reasoning("call_1".into(), "hidden reasoning".into());
+
+        let mistral = to_chat_request_with_upstream(
+            &reasoning_replay_request(),
+            vec![],
+            &sessions,
+            Some("api.mistral.ai"),
+        );
+
+        let assistant = &mistral.messages[0];
+        assert_eq!(assistant.role, "assistant");
+        assert!(
+            assistant.reasoning_content.is_none(),
+            "Mistral rejects reasoning_content on assistant messages (422 extra_forbidden)"
+        );
+        // Tool-call replay and ordering must survive the strip.
+        let calls = assistant.tool_calls.as_ref().expect("tool calls kept");
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[0]["function"]["name"], "shell");
+        assert_eq!(mistral.messages[1].role, "tool");
+        assert_eq!(mistral.messages[1].tool_call_id.as_deref(), Some("call_1"));
+
+        // The serialized wire shape must not contain the field anywhere.
+        let wire = serde_json::to_value(&mistral).unwrap();
+        for message in wire["messages"].as_array().unwrap() {
+            assert!(
+                message.get("reasoning_content").is_none(),
+                "wire message still carries reasoning_content: {message}"
+            );
+        }
+
+        // The session store is untouched: retained history keeps the
+        // reasoning so other consumers and providers can still use it.
+        let retained = &mistral.retained_messages[0];
+        assert_eq!(
+            retained.reasoning_content.as_deref(),
+            Some("hidden reasoning")
+        );
+    }
+
+    #[test]
+    fn non_mistral_upstream_keeps_history_reasoning_content() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let sessions = SessionStore::new();
+        sessions.store_reasoning("call_1".into(), "hidden reasoning".into());
+
+        for host in [None, Some("open.bigmodel.cn"), Some("127.0.0.1")] {
+            let chat =
+                to_chat_request_with_upstream(&reasoning_replay_request(), vec![], &sessions, host);
+            let assistant = &chat.messages[0];
+            assert_eq!(
+                assistant.reasoning_content.as_deref(),
+                Some("hidden reasoning"),
+                "host {host:?} must keep replayed reasoning_content"
+            );
+            let wire = serde_json::to_value(&chat).unwrap();
+            assert_eq!(
+                wire["messages"][0]["reasoning_content"],
+                json!("hidden reasoning"),
+                "host {host:?} wire shape must carry reasoning_content"
+            );
+        }
+    }
+
+    #[test]
+    fn mistral_reasoning_strip_honors_the_kill_switch() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let sessions = SessionStore::new();
+        sessions.store_reasoning("call_1".into(), "hidden reasoning".into());
+
+        std::env::set_var("CODEX_RELAY_DISABLE_QUIRKS", "mistral_reasoning_content");
+        let chat = to_chat_request_with_upstream(
+            &reasoning_replay_request(),
+            vec![],
+            &sessions,
+            Some("api.mistral.ai"),
+        );
+        std::env::remove_var("CODEX_RELAY_DISABLE_QUIRKS");
+
+        assert_eq!(
+            chat.messages[0].reasoning_content.as_deref(),
+            Some("hidden reasoning"),
+            "disabling the quirk must restore the unstripped request shape"
+        );
     }
 
     #[test]

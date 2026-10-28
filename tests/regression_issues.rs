@@ -2558,3 +2558,351 @@ async fn issue_24_v2_encrypted_spawn_child_context_is_isolated() {
         "V2 encrypted child request should contain exactly the spawned message as user input"
     );
 }
+
+/// Mistral-hosted GLM streams reasoning as structured `thinking` blocks inside
+/// `delta.content` instead of a plain string. Regression: the relay used to
+/// reject such chunks with "invalid type: sequence, expected a string".
+#[tokio::test]
+async fn mistral_structured_content_stream_separates_thinking_and_text() {
+    let mistral_sse = sse_from_chunks(vec![
+        json!({"choices":[{"delta":{"role":"assistant","content":[]}}]}),
+        json!({"choices":[{"delta":{"content":[
+            {"type":"thinking","thinking":[{"type":"text","text":"The user"}],"closed":false}
+        ]}}]}),
+        json!({"choices":[{"delta":{"content":[
+            {"type":"thinking","thinking":[{"type":"text","text":" greets"}],"closed":true}
+        ]}}]}),
+        json!({"choices":[{"delta":{"content":[
+            {"type":"text","text":"Hello!"}
+        ]}}]}),
+        json!({"choices":[{"delta":{},"finish_reason":"stop"}],
+               "usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}),
+    ]);
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![mistral_sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({
+            "model": "zai-glm-5-3-flash",
+            "input": "Say hi.",
+            "tools": [],
+            "stream": true
+        }),
+    )
+    .await;
+
+    let reasoning: String = events
+        .iter()
+        .filter(|(event, _)| event == "response.reasoning_summary_text.delta")
+        .filter_map(|(_, data)| data["delta"].as_str())
+        .collect();
+    assert_eq!(
+        reasoning, "The user greets",
+        "thinking blocks route to reasoning"
+    );
+
+    let text: String = events
+        .iter()
+        .filter(|(event, _)| event == "response.output_text.delta")
+        .filter_map(|(_, data)| data["delta"].as_str())
+        .collect();
+    assert_eq!(text, "Hello!", "text blocks route to visible output");
+
+    // Thinking precedes the answer in the emitted event order.
+    let first_reasoning = events
+        .iter()
+        .position(|(event, _)| event == "response.reasoning_summary_text.delta")
+        .expect("reasoning delta event");
+    let first_text = events
+        .iter()
+        .position(|(event, _)| event == "response.output_text.delta")
+        .expect("text delta event");
+    assert!(first_reasoning < first_text);
+
+    let completed = events
+        .iter()
+        .find_map(|(event, data)| (event == "response.completed").then_some(data))
+        .expect("response.completed");
+    assert_eq!(completed["response"]["output"][0]["type"], "reasoning");
+    assert_eq!(
+        completed["response"]["output"][0]["summary"][0]["text"],
+        "The user greets"
+    );
+    assert_eq!(completed["response"]["output"][1]["type"], "message");
+    assert_eq!(
+        completed["response"]["output"][1]["content"][0]["text"],
+        "Hello!"
+    );
+}
+
+#[tokio::test]
+async fn mistral_mixed_content_delta_maps_both_channels_in_order() {
+    // A single delta carrying a thinking block followed by a text block must
+    // produce a reasoning delta before the text delta.
+    let mistral_sse = sse_from_chunks(vec![
+        json!({"choices":[{"delta":{"content":[
+            {"type":"thinking","thinking":[{"type":"text","text":"hmm"}],"closed":true},
+            {"type":"text","text":"answer"}
+        ]}}]}),
+        json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+    ]);
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![mistral_sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({"model": "zai-glm-5-3-flash", "input": "hi", "tools": [], "stream": true}),
+    )
+    .await;
+
+    let reasoning: String = events
+        .iter()
+        .filter(|(event, _)| event == "response.reasoning_summary_text.delta")
+        .filter_map(|(_, data)| data["delta"].as_str())
+        .collect();
+    assert_eq!(reasoning, "hmm");
+    let text: String = events
+        .iter()
+        .filter(|(event, _)| event == "response.output_text.delta")
+        .filter_map(|(_, data)| data["delta"].as_str())
+        .collect();
+    assert_eq!(text, "answer");
+    let first_reasoning = events
+        .iter()
+        .position(|(event, _)| event == "response.reasoning_summary_text.delta")
+        .expect("reasoning delta event");
+    let first_text = events
+        .iter()
+        .position(|(event, _)| event == "response.output_text.delta")
+        .expect("text delta event");
+    assert!(first_reasoning < first_text);
+}
+
+#[tokio::test]
+async fn mistral_structured_content_stream_keeps_tool_calls_and_string_deltas() {
+    // Structured thinking blocks must not disturb tool-call accumulation, and
+    // plain string content deltas from the same stream shape must still work.
+    let mistral_sse = sse_from_chunks(vec![
+        json!({"choices":[{"delta":{"content":[
+            {"type":"thinking","thinking":[{"type":"text","text":"need a shell"}],"closed":true}
+        ]}}]}),
+        json!({"choices":[{"delta":{
+            "tool_calls":[{"index":0,"id":"call_m1","function":{"name":"shell","arguments":"{\"cmd\":\"ls\"}"}}]
+        }}]}),
+        json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+    ]);
+    let (upstream_port, _bodies) = spawn_mock_upstream_with_responses(vec![mistral_sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let events = post_stream_events(
+        &relay,
+        json!({
+            "model": "zai-glm-5-3-flash",
+            "input": "list files",
+            "tools": [{"type": "function", "name": "shell", "parameters": {}}],
+            "stream": true
+        }),
+    )
+    .await;
+
+    let reasoning: String = events
+        .iter()
+        .filter(|(event, _)| event == "response.reasoning_summary_text.delta")
+        .filter_map(|(_, data)| data["delta"].as_str())
+        .collect();
+    assert_eq!(reasoning, "need a shell");
+
+    let completed = events
+        .iter()
+        .find_map(|(event, data)| (event == "response.completed").then_some(data))
+        .expect("response.completed");
+    let tool_item = completed["response"]["output"]
+        .as_array()
+        .expect("output items")
+        .iter()
+        .find(|item| item["type"] == "function_call")
+        .expect("function_call item");
+    assert_eq!(tool_item["call_id"], "call_m1");
+    assert_eq!(tool_item["name"], "shell");
+    assert_eq!(tool_item["arguments"], "{\"cmd\":\"ls\"}");
+}
+
+/// Two-turn round trip with Mistral-hosted GLM reasoning: turn 1 streams
+/// structured thinking blocks and a tool call; turn 2 replays the assistant
+/// history (reasoning + tool call + tool result). The upstream request must
+/// carry the replayed assistant turn with reasoning_content and intact
+/// tool-call wiring on non-Mistral hosts (the mock's localhost is not
+/// mistral.ai) — that field is exactly what Mistral rejects with 422
+/// extra_forbidden; the mistral_reasoning_content quirk strips it at
+/// translation for Mistral hosts (unit-covered on
+/// to_chat_request_with_upstream, which the e2e harness cannot point at a
+/// fake mistral.ai host).
+#[tokio::test]
+async fn mistral_two_turn_history_replays_reasoning_and_tool_calls() {
+    let turn1_sse = sse_from_chunks(vec![
+        json!({"choices":[{"delta":{"role":"assistant","content":[]}}]}),
+        json!({"choices":[{"delta":{"content":[
+            {"type":"thinking","thinking":[{"type":"text","text":"need a listing"}],"closed":true}
+        ]}}]}),
+        json!({"choices":[{"delta":{
+            "tool_calls":[{"index":0,"id":"call_t1","function":{"name":"shell","arguments":"{\"cmd\":\"ls\"}"}}]
+        }}]}),
+        json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}],
+               "usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}}),
+    ]);
+    let turn2_sse = sse_from_chunks(vec![
+        json!({"choices":[{"delta":{"role":"assistant","content":"2 files."}}]}),
+        json!({"choices":[{"delta":{},"finish_reason":"stop"}],
+               "usage":{"prompt_tokens":15,"completion_tokens":3,"total_tokens":18}}),
+    ]);
+    let (upstream_port, bodies) =
+        spawn_mock_upstream_with_responses(vec![turn1_sse, turn2_sse]).await;
+    let relay = Relay::spawn(&format!("http://127.0.0.1:{upstream_port}/v1"));
+
+    let tools = json!([{"type": "function", "name": "shell", "parameters": {"type": "object"}}]);
+    let first = post_stream_completed(
+        &relay,
+        json!({
+            "model": "zai-glm-5-3-flash",
+            "input": "list the files",
+            "tools": tools,
+            "stream": true
+        }),
+    )
+    .await;
+
+    // Turn 1: thinking block -> reasoning item; tool call emitted after it.
+    let output1 = first["response"]["output"].as_array().unwrap();
+    let reasoning = output1
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .map(|item| {
+            item["summary"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        })
+        .unwrap_or_default();
+    assert_eq!(reasoning, "need a listing");
+    let call_id = output1
+        .iter()
+        .find_map(|item| {
+            (item["type"] == "function_call")
+                .then(|| item["call_id"].as_str().unwrap_or("").to_string())
+        })
+        .expect("function_call item");
+    assert_eq!(call_id, "call_t1");
+
+    // Turn 2: same session via previous_response_id, tool result included.
+    let completed2 = post_stream_completed(
+        &relay,
+        json!({
+            "model": "zai-glm-5-3-flash",
+            "input": [
+                {"type": "function_call_output", "call_id": call_id, "output": "a.txt\nb.txt"}
+            ],
+            "tools": tools,
+            "previous_response_id": first["response"]["id"].as_str().unwrap_or(""),
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(
+        completed2["response"]["output"][0]["content"][0]["text"],
+        "2 files."
+    );
+
+    // The turn-2 upstream request replays the assistant turn with the
+    // reasoning_content from turn 1, the original tool call, and the tool
+    // result, in order.
+    let request_bodies = bodies.lock().unwrap();
+    let turn2_body = request_bodies.last().expect("turn 2 upstream body");
+    let messages = turn2_body["messages"].as_array().expect("messages");
+    let assistant = messages
+        .iter()
+        .find(|m| m["role"] == "assistant" && m["tool_calls"].is_array())
+        .expect("replayed assistant turn");
+    assert_eq!(
+        assistant["reasoning_content"],
+        json!("need a listing"),
+        "non-Mistral upstreams must keep replayed reasoning_content (this is the field Mistral rejects; stripped for mistral hosts at translation)"
+    );
+    assert_eq!(assistant["tool_calls"][0]["id"], "call_t1");
+    assert_eq!(assistant["tool_calls"][0]["function"]["name"], "shell");
+    let tool_msg = messages
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("tool result message");
+    assert_eq!(tool_msg["tool_call_id"], "call_t1");
+    assert_eq!(tool_msg["content"], "a.txt\nb.txt");
+}
+
+/// Mistral-hosted GLM returns `content` as structured blocks in blocking
+/// (`stream: false`) responses too. `ChatMessage::text_content()` returns ""
+/// for a non-string `content`, so before normalization the relay emitted an
+/// empty assistant message and dropped the reasoning that lived in the
+/// `thinking` block.
+#[test]
+fn blocking_structured_content_blocks_are_flattened() {
+    let chat = ChatResponse {
+        choices: vec![ChatChoice {
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: Some(json!([
+                    {"type": "thinking", "thinking": [{"type": "text", "text": "weighing options"}], "closed": true},
+                    {"type": "text", "text": "Here is the answer."}
+                ])),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+        }],
+        usage: None,
+    };
+
+    let (response, _) = from_chat_response_with_tool_map(
+        "resp_blocks".into(),
+        "mock-model",
+        chat,
+        &Default::default(),
+    );
+
+    let message = response
+        .output
+        .iter()
+        .find(|item| item["type"] == "message")
+        .expect("blocking reply must still produce a message item");
+    assert_eq!(message["content"][0]["text"], "Here is the answer.");
+
+    let reasoning = response
+        .output
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .expect("thinking block must be surfaced as reasoning");
+    assert_eq!(reasoning["summary"][0]["text"], "weighing options");
+}
+
+/// The normalizer must not touch multimodal *input* part arrays, which are
+/// structural rather than block-shaped text.
+#[test]
+fn response_normalizer_ignores_multimodal_parts() {
+    let mut message = ChatMessage {
+        role: "user".into(),
+        content: Some(json!([
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        ])),
+        reasoning_content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    };
+    let before = message.content.clone();
+    message.normalize_response_content();
+    assert_eq!(
+        message.content, before,
+        "input part arrays must pass through untouched"
+    );
+}

@@ -99,13 +99,18 @@ impl CorpusState {
         let delta = &messages[start..];
 
         if !delta.is_empty() {
+            // An empty `reasoning_content` is a transport requirement, not
+            // content: thinking-mode providers reject a turn where the field is
+            // absent. Strip it from the archive so training consumers never have
+            // to tell "" apart from a real reasoning trace.
+            let archived: Vec<ChatMessage> = delta.iter().map(strip_empty_reasoning).collect();
             let record = json!({
                 "conversation_id": conversation_id,
                 "response_id": response_id,
                 "parent_response_id": parent,
                 "timestamp_unix_ms": now_unix_ms(),
                 "model": model,
-                "messages": delta,
+                "messages": archived,
             });
             if let Err(e) = self.append(&record) {
                 warn!("failed to append corpus turn for {response_id}: {e}");
@@ -148,6 +153,16 @@ impl CorpusState {
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         file.write_all(line.as_bytes())
     }
+}
+
+/// Drop a placeholder `reasoning_content` so the archived conversation carries
+/// only reasoning the model actually produced.
+fn strip_empty_reasoning(message: &ChatMessage) -> ChatMessage {
+    let mut message = message.clone();
+    if message.reasoning_content.as_deref() == Some("") {
+        message.reasoning_content = None;
+    }
+    message
 }
 
 fn now_unix_ms() -> u128 {
@@ -303,6 +318,33 @@ mod tests {
         assert_eq!(messages[1]["reasoning_content"], "let me think");
         assert_eq!(messages[1]["tool_calls"][0]["function"]["name"], "exec");
         assert_eq!(messages[2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn placeholder_reasoning_content_is_not_archived() {
+        let dir = temp_dir("empty-reasoning");
+        let recorder = CorpusRecorder::new(&dir).unwrap();
+
+        // translate.rs sends "" so thinking-mode providers accept the replay;
+        // the archive must not record that placeholder as if it were reasoning.
+        let mut assistant = msg("assistant", "");
+        assistant.reasoning_content = Some(String::new());
+        assistant.tool_calls = Some(vec![json!({
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "exec", "arguments": "{}"}
+        })]);
+
+        let full = vec![msg("user", "run"), assistant];
+        recorder.record_turn(None, "resp_e", "m", &full);
+
+        let lines = read_lines(&dir);
+        let messages = lines[0]["messages"].as_array().unwrap();
+        assert!(
+            messages[1].get("reasoning_content").is_none(),
+            "empty placeholder must be dropped from the archive, got {messages:?}"
+        );
+        assert_eq!(messages[1]["tool_calls"][0]["function"]["name"], "exec");
     }
 
     #[test]

@@ -263,8 +263,9 @@ pub fn translate_stream(
                                 // channels: the native `reasoning_content` /
                                 // `reasoning` fields (kimi-k2.6, GLM native),
                                 // `thinking` blocks inside structured content
-                                // (Mistral-hosted GLM), and ` threshin>` markup healed
-                                // out of the text stream (quirk think_tags).
+                                // (Mistral-hosted GLM), and `<think>` markup
+                                // healed out of the text stream (quirk
+                                // think_tags).
                                 // Structured thinking is part of the content
                                 // stream, so it precedes the healed text.
                                 {

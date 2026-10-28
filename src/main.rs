@@ -178,11 +178,15 @@ async fn main() -> Result<()> {
                     .trim_end_matches(".io")
             })
             .unwrap_or("custom");
+        // Codex must dial the relay, not the upstream API, so the generated
+        // base_url comes from the relay's listener configuration.
+        let relay_base_url = local_relay_base_url(args.bind, args.port);
         print_codex_config(
             &client,
             &upstream,
             &api_key,
             provider_name,
+            &relay_base_url,
             args.model_catalog.as_deref(),
             args.model_template.as_deref(),
         )
@@ -344,6 +348,20 @@ async fn cleanup_sessions(sessions: SessionStore) {
     }
 }
 
+/// The relay's own endpoint as Codex should dial it: the configured bind
+/// address and port serving `/v1/responses`, not the upstream API. An
+/// unspecified bind address (0.0.0.0, ::) is replaced with its loopback so the
+/// generated URL is dialable from the same machine.
+fn local_relay_base_url(bind: std::net::IpAddr, port: u16) -> String {
+    let host = match bind {
+        std::net::IpAddr::V4(v4) if v4.is_unspecified() => "127.0.0.1".to_string(),
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) if v6.is_unspecified() => "[::1]".to_string(),
+        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+    };
+    format!("http://{host}:{port}/v1")
+}
+
 /// Print a Codex config.toml snippet and optionally generate the full model
 /// catalog required by recent Codex versions.
 async fn print_codex_config(
@@ -351,6 +369,7 @@ async fn print_codex_config(
     upstream: &Url,
     api_key: &str,
     provider_name: &str,
+    relay_base_url: &str,
     model_catalog_path: Option<&std::path::Path>,
     model_template: Option<&str>,
 ) -> Result<()> {
@@ -393,48 +412,97 @@ async fn print_codex_config(
             .with_context(|| format!("failed to write model catalog to {}", path.display()))?;
     }
 
+    let model = if !models.is_empty() && !models[0].starts_with('<') {
+        Some(models[0].as_str())
+    } else {
+        None
+    };
+    let model_catalog_line = model_catalog_path
+        .map(|path| -> Result<String> {
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(path)
+            };
+            let absolute = absolute
+                .to_str()
+                .context("model catalog path is not valid UTF-8")?;
+            Ok(absolute.to_string())
+        })
+        .transpose()?;
+    let snippet = format_codex_config_snippet(
+        provider_name,
+        model,
+        model_catalog_line.as_deref(),
+        relay_base_url,
+    )?;
+
     println!(
         "# ── Codex config snippet for {} ──",
         upstream.host_str().unwrap_or("custom")
     );
     println!("# Copy the lines below into ~/.codex/config.toml");
     println!();
-    println!("model_provider = {}", toml_string(provider_name)?);
+    print!("{snippet}");
+    Ok(())
+}
 
-    if !models.is_empty() && !models[0].starts_with('<') {
-        println!("model = {}", toml_string(&models[0])?);
-    } else {
-        println!("model = \"<CHOOSE_A_MODEL>\"");
+/// Build the TOML body of the `--print-config` Codex snippet: the model
+/// selection plus the `[model_providers.*]` block. `base_url` is the local
+/// relay listener, not the upstream API — Codex sends Responses requests to
+/// the relay, which translates them for the upstream.
+fn format_codex_config_snippet(
+    provider_name: &str,
+    model: Option<&str>,
+    model_catalog_path: Option<&str>,
+    relay_base_url: &str,
+) -> Result<String> {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    writeln!(out, "model_provider = {}", toml_string(provider_name)?)?;
+    match model {
+        Some(model) => writeln!(out, "model = {}", toml_string(model)?)?,
+        None => writeln!(out, "model = \"<CHOOSE_A_MODEL>\"")?,
     }
-    if let Some(path) = model_catalog_path {
-        let absolute = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()?.join(path)
-        };
-        let absolute = absolute
-            .to_str()
-            .context("model catalog path is not valid UTF-8")?;
-        println!("model_catalog_json = {}", toml_string(absolute)?);
-    } else {
-        println!("# To register upstream models in Codex's model picker, rerun with:");
-        println!("#   --model-catalog ~/.codex/codex-relay-models.json");
+    match model_catalog_path {
+        Some(path) => writeln!(out, "model_catalog_json = {}", toml_string(path)?)?,
+        None => {
+            writeln!(
+                out,
+                "# To register upstream models in Codex's model picker, rerun with:"
+            )?;
+            writeln!(out, "#   --model-catalog ~/.codex/codex-relay-models.json")?;
+        }
     }
-    println!();
-    println!("[model_providers.{}]", toml_string(provider_name)?);
-    println!("name = {}", toml_string(provider_name)?);
-    println!(
-        "base_url = {}",
-        toml_string(upstream.as_str().trim_end_matches('/'))?
-    );
-    println!("wire_api = \"responses\"");
+    writeln!(out)?;
+    writeln!(out, "[model_providers.{}]", toml_string(provider_name)?)?;
+    writeln!(out, "name = {}", toml_string(provider_name)?)?;
+    writeln!(
+        out,
+        "# The relay must already be running and listening here: Codex talks to it,"
+    )?;
+    writeln!(
+        out,
+        "# and it translates for the upstream API. If Codex runs on another machine,"
+    )?;
+    writeln!(
+        out,
+        "# replace the loopback address with this host's address."
+    )?;
+    writeln!(out, "base_url = {}", toml_string(relay_base_url)?)?;
+    writeln!(out, "wire_api = \"responses\"")?;
+    writeln!(
+        out,
+        "# Codex only requires this variable to exist; the relay authenticates to"
+    )?;
+    writeln!(out, "# the upstream with its own CODEX_RELAY_API_KEY.")?;
     let env_key = format!(
         "{}_API_KEY",
         provider_name.to_uppercase().replace(['-', '.'], "_")
     );
-    println!("env_key = {}", toml_string(&env_key)?);
-    println!();
-    Ok(())
+    writeln!(out, "env_key = {}", toml_string(&env_key)?)?;
+    writeln!(out)?;
+    Ok(out)
 }
 
 fn toml_string(value: &str) -> Result<String> {
@@ -2041,6 +2109,100 @@ mod tests {
         assert_eq!(
             toml_string("model\"\nnotify = [\"bad\"]").unwrap(),
             "\"model\\\"\\nnotify = [\\\"bad\\\"]\""
+        );
+    }
+
+    #[test]
+    fn local_relay_base_url_respects_configured_port() {
+        // Regression: --print-config used to emit the upstream API URL as
+        // base_url, so Codex called e.g. https://api.mistral.ai/v1/responses
+        // directly and got HTTP 404. It must dial the relay listener instead,
+        // on the configured bind address and port.
+        assert_eq!(
+            local_relay_base_url("127.0.0.1".parse().unwrap(), 4449),
+            "http://127.0.0.1:4449/v1"
+        );
+        assert_eq!(
+            local_relay_base_url("127.0.0.1".parse().unwrap(), 4444),
+            "http://127.0.0.1:4444/v1"
+        );
+    }
+
+    #[test]
+    fn local_relay_base_url_maps_unspecified_bind_to_loopback() {
+        // 0.0.0.0 and :: are listener wildcards, not dialable destinations.
+        assert_eq!(
+            local_relay_base_url("0.0.0.0".parse().unwrap(), 4449),
+            "http://127.0.0.1:4449/v1"
+        );
+        assert_eq!(
+            local_relay_base_url("::".parse().unwrap(), 4449),
+            "http://[::1]:4449/v1"
+        );
+        assert_eq!(
+            local_relay_base_url("::1".parse().unwrap(), 4444),
+            "http://[::1]:4444/v1"
+        );
+    }
+
+    #[test]
+    fn config_snippet_points_base_url_at_the_relay_not_the_upstream() {
+        let snippet = format_codex_config_snippet(
+            "mistral",
+            Some("zai-glm-5-3-flash"),
+            None,
+            "http://127.0.0.1:4449/v1",
+        )
+        .unwrap();
+
+        assert!(
+            snippet.contains("base_url = \"http://127.0.0.1:4449/v1\""),
+            "{snippet}"
+        );
+        assert!(!snippet.contains("api.mistral.ai"), "{snippet}");
+        assert!(snippet.contains("wire_api = \"responses\""), "{snippet}");
+        assert!(
+            snippet.contains("env_key = \"MISTRAL_API_KEY\""),
+            "{snippet}"
+        );
+        assert!(
+            snippet.contains("#   --model-catalog ~/.codex/codex-relay-models.json"),
+            "{snippet}"
+        );
+        // The snippet now dials the relay, so it must say the relay has to be
+        // up first, and that the env var is only a Codex-side precondition.
+        assert!(
+            snippet.contains("The relay must already be running"),
+            "{snippet}"
+        );
+        assert!(snippet.contains("CODEX_RELAY_API_KEY"), "{snippet}");
+        assert!(
+            snippet.contains("replace the loopback address"),
+            "{snippet}"
+        );
+    }
+
+    #[test]
+    fn config_snippet_embeds_model_and_catalog_when_available() {
+        let snippet = format_codex_config_snippet(
+            "mistral",
+            Some("zai-glm-5-3-flash"),
+            Some("/home/user/.codex/codex-relay-models.json"),
+            "http://127.0.0.1:4444/v1",
+        )
+        .unwrap();
+
+        assert!(
+            snippet.contains("model = \"zai-glm-5-3-flash\""),
+            "{snippet}"
+        );
+        assert!(
+            snippet.contains("model_catalog_json = \"/home/user/.codex/codex-relay-models.json\""),
+            "{snippet}"
+        );
+        assert!(
+            !snippet.contains("--model-catalog"),
+            "the rerun hint must disappear once the catalog is written: {snippet}"
         );
     }
 

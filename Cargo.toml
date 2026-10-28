@@ -1,6 +1,6 @@
 [package]
 name = "codex-relay"
-version = "0.5.8"
+version = "0.6.0"
 edition = "2021"
 description = "Responses API ↔ Chat Completions translation bridge for Codex CLI"
 license = "MIT"

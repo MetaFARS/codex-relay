@@ -5,6 +5,7 @@ pub mod quirks;
 pub mod session;
 pub mod stream;
 pub mod think;
+pub mod timing;
 pub mod translate;
 pub mod types;
 pub mod upstream_request;

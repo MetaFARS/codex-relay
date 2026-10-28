@@ -6,6 +6,7 @@ mod session;
 mod shutdown;
 mod stream;
 mod think;
+mod timing;
 mod translate;
 mod types;
 mod upstream_request;
@@ -923,6 +924,7 @@ async fn handle_responses(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    let mut trace = timing::RequestTrace::start();
     let req: ResponsesRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
         Err(error) => {
@@ -930,6 +932,7 @@ async fn handle_responses(
             return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response();
         }
     };
+    trace.record_request_size(body.len(), &req.tools);
     debug!(
         "→ model={} stream={} input_items={} tools={} prev_resp={:?}",
         req.model,
@@ -955,7 +958,7 @@ async fn handle_responses(
         };
         return handle_opencode_responses(state, payload, req, headers).await;
     }
-    handle_responses_inner(state, req).await
+    handle_responses_inner(state, req, trace).await
 }
 
 async fn handle_opencode_responses(
@@ -1061,7 +1064,11 @@ async fn handle_opencode_responses(
     }
 }
 
-async fn handle_responses_inner(state: AppState, mut req: ResponsesRequest) -> Response {
+async fn handle_responses_inner(
+    state: AppState,
+    mut req: ResponsesRequest,
+    mut trace: timing::RequestTrace,
+) -> Response {
     if let Err(message) = translate::validate_unique_chat_tool_names(&req.tools) {
         return (StatusCode::UNPROCESSABLE_ENTITY, message).into_response();
     }
@@ -1082,6 +1089,7 @@ async fn handle_responses_inner(state: AppState, mut req: ResponsesRequest) -> R
     let namespace_tools = translate::namespace_tool_map(&req.tools);
     let custom_tools = translate::custom_tool_map(&req.tools);
     let mut chat_req = translate::to_chat_request(&req, history, &state.sessions);
+    trace.mark_translated();
     debug!(
         "→ upstream tools={}",
         summarize_debug_names(chat_tool_debug_names(&chat_req.tools))
@@ -1107,6 +1115,7 @@ async fn handle_responses_inner(state: AppState, mut req: ResponsesRequest) -> R
             model,
             corpus: state.corpus,
             previous_response_id,
+            trace,
         })
         .into_response()
     } else {
@@ -1114,11 +1123,14 @@ async fn handle_responses_inner(state: AppState, mut req: ResponsesRequest) -> R
         handle_blocking(
             state,
             chat_req,
-            url,
-            model,
-            namespace_tools,
-            custom_tools,
-            previous_response_id,
+            BlockingCallParams {
+                url,
+                model,
+                namespace_tools,
+                custom_tools,
+                previous_response_id,
+                trace,
+            },
         )
         .await
     }
@@ -1415,15 +1427,30 @@ fn parse_spawn_agent_call(call: &serde_json::Value) -> Option<SpawnAgentCall> {
     })
 }
 
-async fn handle_blocking(
-    state: AppState,
-    chat_req: types::ChatRequest,
+/// Tail parameters of the blocking upstream call, bundled to keep
+/// `handle_blocking`'s signature manageable.
+struct BlockingCallParams {
     url: String,
     model: String,
     namespace_tools: translate::NamespaceToolMap,
     custom_tools: translate::CustomToolMap,
     previous_response_id: Option<String>,
+    trace: timing::RequestTrace,
+}
+
+async fn handle_blocking(
+    state: AppState,
+    chat_req: types::ChatRequest,
+    params: BlockingCallParams,
 ) -> Response {
+    let BlockingCallParams {
+        url,
+        model,
+        namespace_tools,
+        custom_tools,
+        previous_response_id,
+        mut trace,
+    } = params;
     let mut builder = state
         .client
         .post(&url)
@@ -1443,7 +1470,9 @@ async fn handle_blocking(
     let allowed_tool_names =
         translate::allowed_upstream_tool_names(&chat_req.tools, &upstream_body);
 
-    match builder.json(&upstream_body).send().await {
+    let builder = builder.json(&upstream_body);
+    trace.mark(timing::Phase::UpstreamSent);
+    match builder.send().await {
         Err(e) => {
             error!("upstream error: {e}");
             (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
@@ -1459,6 +1488,7 @@ async fn handle_blocking(
                 .into_response()
         }
         Ok(r) => {
+            trace.mark(timing::Phase::UpstreamHeaders);
             let value = match r.json::<serde_json::Value>().await {
                 Ok(value) => value,
                 Err(e) => {
@@ -1474,11 +1504,13 @@ async fn handle_blocking(
                     .unwrap_or("upstream returned an error")
                     .to_string();
                 error!("upstream response error: {message}");
+                trace.finish("blocking-error", false);
                 return (StatusCode::BAD_GATEWAY, message).into_response();
             }
             match serde_json::from_value::<ChatResponse>(value) {
                 Err(e) => {
                     error!("parse error: {e}");
+                    trace.finish("blocking-error", false);
                     (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
                 }
                 Ok(chat_resp) => {
@@ -1486,6 +1518,9 @@ async fn handle_blocking(
                         "← upstream function_calls={}",
                         summarize_debug_names(chat_response_tool_call_debug_names(&chat_resp))
                     );
+                    if let Some(usage) = &chat_resp.usage {
+                        trace.record_usage(usage.prompt_tokens, usage.completion_tokens);
+                    }
                     let response_id = state.sessions.new_id();
                     let (resp, assistant_messages) =
                         if namespace_tools.is_empty() && custom_tools.is_empty() {
@@ -1519,6 +1554,7 @@ async fn handle_blocking(
                         &allowed_tool_names,
                     ) {
                         warn!("rejecting invalid upstream tool calls: {message}");
+                        trace.finish(&response_id, false);
                         return (StatusCode::BAD_GATEWAY, message).into_response();
                     }
 
@@ -1547,7 +1583,10 @@ async fn handle_blocking(
                     }
                     let mut retained_history = chat_req.retained_messages;
                     retained_history.extend(assistant_messages);
-                    state.sessions.save_with_id(response_id, retained_history);
+                    state
+                        .sessions
+                        .save_with_id(response_id.clone(), retained_history);
+                    trace.finish(&response_id, true);
                     Json(resp).into_response()
                 }
             }
